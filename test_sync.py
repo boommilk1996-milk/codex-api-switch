@@ -6,10 +6,12 @@ from __future__ import annotations
 import json
 import base64
 import os
+import platform
 import sqlite3
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 from pathlib import Path
 
 
@@ -323,6 +325,29 @@ def main() -> None:
             )
             st = json.loads(r.stdout)
             check(st["deepseek_key_available"] is False, "json reports no saved key after clear")
+
+        # 11. Windows process detection (tasklist branch)
+        import types
+
+        mod = types.ModuleType("codex_api_switch_mod")
+        mod.__file__ = str(SWITCHER)
+        with open(SWITCHER, encoding="utf-8") as fh:
+            exec(compile(fh.read(), str(SWITCHER), "exec"), mod.__dict__)
+
+        with mock.patch.object(platform, "system", return_value="Windows"):
+            with mock.patch.object(
+                subprocess, "run", side_effect=FileNotFoundError
+            ):
+                check(
+                    mod.is_codex_running() is False,
+                    "windows: no tasklist -> not running",
+                )
+            fake = subprocess.CompletedProcess([], 0, stdout="ChatGPT.exe", stderr="")
+            with mock.patch.object(subprocess, "run", return_value=fake):
+                check(
+                    mod.is_codex_running() is True,
+                    "windows: ChatGPT.exe detected as running",
+                )
 
     print("ALL TESTS PASSED")
 

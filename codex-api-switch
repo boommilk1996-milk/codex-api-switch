@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import sqlite3
@@ -273,6 +274,18 @@ def masked_key(token: str | None) -> str:
 
 def is_codex_running() -> bool:
     """Detect whether the Codex desktop app (ChatGPT/Codex app-server) is running."""
+    if platform.system() == "Windows":
+        for image in ("ChatGPT.exe", "Codex.exe"):
+            try:
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"IMAGENAME eq {image}", "/NH"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if image.lower() in result.stdout.lower():
+                    return True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+        return False
     sock = codex_home() / "ipc" / "ipc.sock"
     try:
         result = subprocess.run(

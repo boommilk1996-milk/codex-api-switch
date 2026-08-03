@@ -66,6 +66,14 @@ cp deepseek-models.json ~/.local/bin/
 osacompile -l JavaScript -o "Codex API 切换.app" Codex_API_切换.app.js
 ```
 
+### Windows
+
+1. 安装 Python 3.11+（安装时勾选 **Add to PATH**）
+2. 双击 `Codex API 切换.cmd` 打开菜单（或右键以 PowerShell 运行 `codex-api-switch-gui.ps1`）
+3. 按菜单操作：查看状态 / 切换服务商 / 同步历史 / 管理 Key
+
+CLI 在 Windows 上同样可用（`codex-api-switch status / deepseek / openai / sync / key`），进程检测会自动使用 `tasklist` 判断 Codex 是否运行。
+
 ### 使用前的准备
 
 1. 本机已安装 Codex（工具操作的是 `~/.codex/` 下的配置与会话）。
