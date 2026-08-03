@@ -27,7 +27,9 @@ function sh(cmd) {
     for (const candidate of candidates) {
         const q = "'" + String(candidate).replace(/'/g, "'\\''") + "'";
         const ok = app
-            .doShellScript(`command -v ${q} >/dev/null 2>&1 && echo yes`)
+            .doShellScript(
+                `if command -v ${q} >/dev/null 2>&1; then echo yes; else echo no; fi`
+            )
             .trim();
         if (ok === "yes") {
             found = candidate;
