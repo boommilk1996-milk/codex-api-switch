@@ -138,12 +138,16 @@ function main() {
     const deepseekInfo = st.deepseek_configured
         ? `DeepSeek: 已配置 (${st.deepseek_base_url || ""})`
         : "DeepSeek: 未配置";
+    const keyInfo = st.deepseek_key_available
+        ? "DeepSeek Key: 已保存（切换时无需再填）"
+        : "DeepSeek Key: 未保存（首次切换时填写一次即可）";
     const restoreInfo = st.restore_available ? "恢复点: 可用" : "恢复点: 无";
     const runningInfo = st.codex_running ? "Codex: 运行中（切换前请先退出）" : "Codex: 未运行（可安全切换）";
 
     const statusLines = [
         `当前: ${providerLabel}  ·  ${modelName}`,
         deepseekInfo,
+        keyInfo,
         restoreInfo,
         runningInfo,
         "",
@@ -195,11 +199,11 @@ function main() {
     if (switchingToDeepseek) {
         // If not configured, ask for API key first
         let apiKeyArg = "";
-        if (!st.deepseek_configured) {
+        if (!st.deepseek_key_available) {
             let keyInput;
             try {
                 keyInput = app.displayDialog(
-                    "未检测到 DeepSeek API Key。\n请输入你的 DeepSeek API Key（以 sk- 开头）：",
+                    "首次切换需要 DeepSeek API Key。\nKey 只会保存一次，之后切换不再需要填写。\n\n请输入你的 DeepSeek API Key（以 sk- 开头）：",
                     {
                         withTitle: "配置 DeepSeek API Key",
                         defaultAnswer: "",

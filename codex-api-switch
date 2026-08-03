@@ -232,6 +232,45 @@ def existing_token(parsed: dict) -> str | None:
     return None
 
 
+def key_store_path() -> Path:
+    return backup_dir() / "deepseek-key"
+
+
+def load_stored_key() -> str | None:
+    """Return the DeepSeek API key saved across provider switches, if any."""
+    path = key_store_path()
+    if not path.exists():
+        return None
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return token or None
+
+
+def save_deepseek_key(token: str) -> None:
+    """Persist the DeepSeek API key so it survives switches back to OpenAI."""
+    backup_dir().mkdir(parents=True, exist_ok=True)
+    path = key_store_path()
+    path.write_text(token.strip() + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def clear_deepseek_key() -> None:
+    key_store_path().unlink(missing_ok=True)
+
+
+def masked_key(token: str | None) -> str:
+    if not token:
+        return "(not set)"
+    if len(token) <= 10:
+        return "(set)"
+    return token[:5] + "***" + token[-4:]
+
+
 def is_codex_running() -> bool:
     """Detect whether the Codex desktop app (ChatGPT/Codex app-server) is running."""
     sock = codex_home() / "ipc" / "ipc.sock"
@@ -288,6 +327,8 @@ def get_status_dict() -> dict:
         "provider": provider if provider else "openai",
         "is_deepseek": is_deepseek,
         "deepseek_configured": bool(deepseek),
+        "deepseek_key_available": bool(deepseek.get("experimental_bearer_token"))
+        or load_stored_key() is not None,
         "deepseek_base_url": deepseek.get("base_url") if deepseek else None,
         "restore_available": has_restore,
         "last_restore_point": last_switch,
@@ -653,14 +694,20 @@ def command_deepseek(args: argparse.Namespace) -> int:
     parsed = parse_toml(text)
 
     if parsed.get("model_provider") == DEEPSEEK_PROVIDER:
+        # Already on DeepSeek: still persist the key so it survives future switches.
+        token = existing_token(parsed) or load_stored_key()
+        if token:
+            save_deepseek_key(token)
+            print("DeepSeek API key persisted for future switches.")
         print("Already using DeepSeek.", file=sys.stderr)
         return 0
 
-    token = args.api_key or existing_token(parsed)
+    token = args.api_key or existing_token(parsed) or load_stored_key()
     if not token:
         print(
             "No DeepSeek API key found.\n"
-            "  Run: codex-api-switch deepseek --api-key 'sk-...'\n"
+            "  Run: codex-api-switch key set 'sk-...'  (saved for future switches)\n"
+            "  Or:  codex-api-switch deepseek --api-key 'sk-...'\n"
             "  Or set DEEPSEEK_API_KEY environment variable.",
             file=sys.stderr,
         )
@@ -677,8 +724,10 @@ def command_deepseek(args: argparse.Namespace) -> int:
     save_restore_points()
     config_file.write_text(render_deepseek_config(text, token), encoding="utf-8")
     write_models_catalog()
+    save_deepseek_key(token)
 
     print(f"Switched to DeepSeek ({DEEPSEEK_MODEL}).")
+    print("DeepSeek API key saved for future switches (codex-api-switch key status).")
     if args.no_sync:
         print("History label sync skipped (--no-sync).")
     elif is_codex_running():
@@ -718,6 +767,14 @@ def command_openai(args: argparse.Namespace) -> int:
     if parsed.get("model_provider") != DEEPSEEK_PROVIDER:
         print("Already using OpenAI.", file=sys.stderr)
         return 0
+
+    deepseek_token = (
+        parsed.get("model_providers", {})
+        .get(DEEPSEEK_PROVIDER, {})
+        .get("experimental_bearer_token")
+    )
+    if deepseek_token:
+        save_deepseek_key(str(deepseek_token))
 
     make_backup("before-openai")
     shutil.copy2(restore_config, config_file)
@@ -780,11 +837,13 @@ def command_status(args: argparse.Namespace) -> int:
 
     if deepseek:
         token = deepseek.get("experimental_bearer_token", "")
-        masked = token[:5] + "***" + token[-4:] if len(token) > 10 else "(set)"
+        masked = masked_key(token)
         print(f"DeepSeek URL: {deepseek.get('base_url', '(missing)')}")
         print(f"DeepSeek key: {masked}")
     else:
         print("DeepSeek: not configured")
+    stored = load_stored_key()
+    print(f"DeepSeek key saved: {masked_key(stored)}")
 
     if (backup_dir() / "openai-last.toml").exists():
         print("Restore point: available")
@@ -795,6 +854,27 @@ def command_status(args: argparse.Namespace) -> int:
         print("Codex desktop: running (history sync requires quitting first)")
     else:
         print("Codex desktop: not running (history sync is safe)")
+    return 0
+
+
+def command_key(args: argparse.Namespace) -> int:
+    if args.action == "set":
+        value = (args.value or "").strip()
+        if not value.startswith("sk-"):
+            print("DeepSeek API key should start with 'sk-'. Nothing saved.", file=sys.stderr)
+            return 2
+        save_deepseek_key(value)
+        print(f"DeepSeek API key saved ({masked_key(value)}).")
+        return 0
+    if args.action == "clear":
+        clear_deepseek_key()
+        print("Saved DeepSeek API key cleared. You will be asked again on next switch.")
+        return 0
+    # status
+    stored = load_stored_key()
+    print(f"Saved DeepSeek API key: {masked_key(stored)}")
+    print("Edit:   codex-api-switch key set 'sk-...'")
+    print("Clear:  codex-api-switch key clear")
     return 0
 
 
@@ -825,6 +905,17 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--dry-run", action="store_true", help="Only show what would change")
     sync.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
     sync.set_defaults(func=command_sync)
+
+    key = sub.add_parser(
+        "key",
+        help="Manage the saved DeepSeek API key (persists across switches)",
+    )
+    key_sub = key.add_subparsers(dest="action")
+    key_sub.add_parser("status", help="Show whether a key is saved (masked)")
+    key_set = key_sub.add_parser("set", help="Save or update the DeepSeek API key")
+    key_set.add_argument("value", help="DeepSeek API key (starts with sk-)")
+    key_sub.add_parser("clear", help="Forget the saved key")
+    key.set_defaults(func=command_key)
 
     status = sub.add_parser("status", help="Show current provider")
     status.add_argument("--json", action="store_true", help="Machine-readable JSON output")

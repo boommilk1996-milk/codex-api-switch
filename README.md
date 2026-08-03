@@ -80,8 +80,13 @@ codex-api-switch status
 # 先预览会同步多少条历史（只读，安全）
 codex-api-switch sync --dry-run
 
-# 完全退出 Codex 后，切到 DeepSeek（自动同步历史）
-codex-api-switch deepseek --api-key 'sk-...'
+# 保存 DeepSeek API Key（只需一次，之后切换不再询问）
+codex-api-switch key set 'sk-...'
+codex-api-switch key status        # 查看是否已保存（只显示掩码）
+codex-api-switch key clear         # 忘记已保存的 Key
+
+# 完全退出 Codex 后，切到 DeepSeek（自动同步历史，Key 自动读取）
+codex-api-switch deepseek
 
 # 切回 OpenAI（同样自动同步历史）
 codex-api-switch openai
@@ -94,8 +99,11 @@ codex-api-switch sync
 
 1. 完全退出 Codex（Cmd+Q）
 2. 双击 `Codex API 切换.app`
-3. 点击"切到 DeepSeek"或"切回 OpenAI"
-4. 应用自动完成配置切换 + 历史同步，重新打开 Codex 即可看到全部历史
+3. 首次切换时按提示填写一次 DeepSeek API Key（之后永久保存，不会再问）
+4. 点击"切到 DeepSeek"或"切回 OpenAI"
+5. 应用自动完成配置切换 + 历史同步，重新打开 Codex 即可看到全部历史
+
+DeepSeek API Key 保存在 `~/.codex/backups/codex-api-switch/deepseek-key`（权限 600，仅当前用户可读），切回 OpenAI 也不会丢失；需要更换时用 `codex-api-switch key set 'sk-...'` 覆盖即可。
 
 ## 测试
 

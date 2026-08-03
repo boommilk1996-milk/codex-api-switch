@@ -250,6 +250,80 @@ def main() -> None:
         conn.close()
         check(providers == {"openai"}, "all user tasks relabeled back to openai")
 
+        # 10. key persistence: set once, switch without --api-key or env
+        with tempfile.TemporaryDirectory(prefix="codex-switch-key-test-") as tmp2:
+            home2 = Path(tmp2)
+            setup_home(home2)
+            # simulate an OpenAI-only config (no deepseek token anywhere)
+            (home2 / "config.toml").write_text('model_provider = "openai"\nmodel = "gpt-5.5"\n')
+            env2 = dict(os.environ)
+            env2["CODEX_SWITCH_HOME"] = str(home2)
+            env2.pop("DEEPSEEK_API_KEY", None)
+
+            # no key anywhere -> switch must fail with a clear message
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "deepseek"],
+                capture_output=True, text=True, env=env2,
+            )
+            check(r.returncode == 2, f"no key -> deepseek fails (got {r.returncode})")
+            check("No DeepSeek API key found" in r.stderr, "no-key error message")
+
+            # save the key once
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "key", "set", "sk-saved-1234567890"],
+                capture_output=True, text=True, env=env2,
+            )
+            check(r.returncode == 0, "key set exits 0")
+            key_file = home2 / "backups" / "codex-api-switch" / "deepseek-key"
+            check(key_file.exists(), "key file created")
+            check((key_file.stat().st_mode & 0o777) == 0o600, "key file mode 600")
+
+            # switch to deepseek now works from the saved key, no prompt needed
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "deepseek"],
+                capture_output=True, text=True, env=env2,
+            )
+            check(r.returncode == 0, f"saved-key deepseek switch exit 0 (got {r.returncode})")
+            check("Switched to DeepSeek" in r.stdout, "saved-key switch succeeded")
+            check("key saved for future switches" in r.stdout, "switch reports key saved")
+
+            # switch back to openai: key must survive (copied from config)
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "openai"],
+                capture_output=True, text=True, env=env2,
+            )
+            check(r.returncode == 0, "openai switch exit 0")
+            check(key_file.exists(), "key file survives openai switch")
+
+            # switch to deepseek again: still no prompt
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "deepseek"],
+                capture_output=True, text=True, env=env2,
+            )
+            check(r.returncode == 0, "second deepseek switch exit 0 without key")
+
+            # key status shows a masked value; clear removes it
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "key", "status"],
+                capture_output=True, text=True, env=env2,
+            )
+            check("sk-sa***7890" in r.stdout, "key status masks value")
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "key", "clear"],
+                capture_output=True, text=True, env=env2,
+            )
+            check(r.returncode == 0, "key clear exit 0")
+            check(not key_file.exists(), "key file removed after clear")
+
+            # status --json reports key availability (config back to openai = no token anywhere)
+            (home2 / "config.toml").write_text('model_provider = "openai"\nmodel = "gpt-5.5"\n')
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "status", "--json"],
+                capture_output=True, text=True, env=env2,
+            )
+            st = json.loads(r.stdout)
+            check(st["deepseek_key_available"] is False, "json reports no saved key after clear")
+
     print("ALL TESTS PASSED")
 
 
