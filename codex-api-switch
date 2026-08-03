@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+"""Switch Codex between the default provider and DeepSeek Responses API.
+
+Also syncs the ``model_provider`` label of local conversation history so that
+every task stays visible in the desktop sidebar after a provider switch.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        print(
+            "tomllib (Python 3.11+) or tomli is required. "
+            "Install with: pip3 install tomli",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEEPSEEK_PROVIDER = "deepseek"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/"
+BACKUP_NAME = "codex-api-switch"
+
+
+def codex_home() -> Path:
+    override = os.environ.get("CODEX_SWITCH_HOME")
+    if override:
+        return Path(override).expanduser()
+    return Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+
+
+def config_path() -> Path:
+    return codex_home() / "config.toml"
+
+
+def models_path() -> Path:
+    return codex_home() / "models.json"
+
+
+def backup_dir() -> Path:
+    return codex_home() / "backups" / BACKUP_NAME
+
+
+def state_db_path() -> Path:
+    return codex_home() / "state_5.sqlite"
+
+
+def session_index_path() -> Path:
+    return codex_home() / "session_index.jsonl"
+
+
+def model_catalog_value() -> str:
+    if os.environ.get("CODEX_SWITCH_HOME") or os.environ.get("CODEX_HOME"):
+        return str(models_path())
+    return "~/.codex/models.json"
+
+
+def load_text(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def parse_toml(text: str) -> dict:
+    if not text.strip():
+        return {}
+    return tomllib.loads(text)
+
+
+def quote(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def section_bounds(lines: list[str], section: str) -> tuple[int, int] | None:
+    header = f"[{section}]"
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == header:
+            start = index
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        stripped = lines[index].strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            end = index
+            break
+    return start, end
+
+
+def split_top_level(lines: list[str]) -> tuple[list[str], list[str]]:
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            return lines[:index], lines[index:]
+    return lines, []
+
+
+def remove_top_keys(top_lines: list[str], keys: set[str]) -> list[str]:
+    pattern = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*=")
+    kept: list[str] = []
+    for line in top_lines:
+        match = pattern.match(line)
+        if match and match.group(1) in keys:
+            continue
+        kept.append(line)
+    while kept and not kept[0].strip():
+        kept.pop(0)
+    return kept
+
+
+def render_deepseek_config(existing_text: str, token: str) -> str:
+    lines = existing_text.splitlines()
+    top_lines, rest = split_top_level(lines)
+    top_values = {
+        "model": DEEPSEEK_MODEL,
+        "model_provider": DEEPSEEK_PROVIDER,
+        "preferred_auth_method": "apikey",
+        "forced_login_method": "api",
+        "model_reasoning_effort": "high",
+        "model_catalog_json": model_catalog_value(),
+    }
+    new_top = [f"{key} = {quote(value)}" for key, value in top_values.items()]
+    remaining_top = remove_top_keys(top_lines, set(top_values))
+    if remaining_top:
+        new_top.extend(["", *remaining_top])
+
+    bounds = section_bounds(rest, f"model_providers.{DEEPSEEK_PROVIDER}")
+    if bounds:
+        start, end = bounds
+        rest = rest[:start] + rest[end:]
+
+    while rest and not rest[-1].strip():
+        rest.pop()
+
+    provider = [
+        "",
+        f"[model_providers.{DEEPSEEK_PROVIDER}]",
+        f"name = {quote(DEEPSEEK_PROVIDER)}",
+        f"base_url = {quote(DEEPSEEK_BASE_URL)}",
+        'wire_api = "responses"',
+        f"experimental_bearer_token = {quote(token)}",
+    ]
+    rendered = "\n".join([*new_top, *rest, *provider]).rstrip() + "\n"
+    parse_toml(rendered)
+    return rendered
+
+
+def write_models_catalog() -> None:
+    source = Path(__file__).with_name("deepseek-models.json")
+    if source.exists():
+        data = json.loads(source.read_text(encoding="utf-8"))
+    else:
+        data = {
+            "models": [
+                {
+                    "slug": DEEPSEEK_MODEL,
+                    "display_name": "DeepSeek-V4-Flash",
+                    "context_window": 1048576,
+                    "max_context_window": 1048576,
+                    "supported_in_api": True,
+                    "visibility": "list",
+                }
+            ]
+        }
+    slugs = {item.get("slug") for item in data.get("models", [])}
+    if DEEPSEEK_MODEL not in slugs:
+        raise SystemExit("models catalog is missing deepseek-v4-flash")
+    models_path().write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def make_backup(label: str) -> None:
+    backup_dir().mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if config_path().exists():
+        shutil.copy2(config_path(), backup_dir() / f"config-{label}-{stamp}.toml")
+    if models_path().exists():
+        shutil.copy2(models_path(), backup_dir() / f"models-{label}-{stamp}.json")
+
+
+def save_restore_points() -> None:
+    backup_dir().mkdir(parents=True, exist_ok=True)
+    parsed = parse_toml(load_text(config_path()))
+    current_provider = parsed.get("model_provider")
+    if current_provider != DEEPSEEK_PROVIDER and config_path().exists():
+        shutil.copy2(config_path(), backup_dir() / "openai-last.toml")
+    if models_path().exists():
+        shutil.copy2(models_path(), backup_dir() / "models-last.json")
+        (backup_dir() / "models-was-absent").unlink(missing_ok=True)
+    else:
+        (backup_dir() / "models-was-absent").write_text("1\n", encoding="utf-8")
+        (backup_dir() / "models-last.json").unlink(missing_ok=True)
+
+
+def existing_token(parsed: dict) -> str | None:
+    provider_token = (
+        parsed.get("model_providers", {})
+        .get(DEEPSEEK_PROVIDER, {})
+        .get("experimental_bearer_token")
+    )
+    if provider_token:
+        return str(provider_token)
+    env_token = os.environ.get("DEEPSEEK_API_KEY")
+    if env_token:
+        return env_token
+    shell_token = (
+        parsed.get("shell_environment_policy", {})
+        .get("set", {})
+        .get("ANTHROPIC_AUTH_TOKEN")
+    )
+    if shell_token:
+        return str(shell_token)
+    return None
+
+
+def is_codex_running() -> bool:
+    """Detect whether the Codex desktop app (ChatGPT/Codex app-server) is running."""
+    sock = codex_home() / "ipc" / "ipc.sock"
+    try:
+        result = subprocess.run(
+            ["lsof", str(sock)],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    # With a simulated home (CODEX_SWITCH_HOME), only the local socket counts.
+    if os.environ.get("CODEX_SWITCH_HOME"):
+        return False
+    for pattern in (
+        "ChatGPT.app/Contents/MacOS/ChatGPT",
+        "Codex.app/Contents/MacOS/Codex",
+        "com.openai.codex",
+    ):
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+    return False
+
+
+def get_status_dict() -> dict:
+    """Return current status as a dict for JSON output."""
+    text = load_text(config_path())
+    parsed = parse_toml(text)
+    provider = parsed.get("model_provider")
+    model = parsed.get("model", "(not set)")
+    deepseek = parsed.get("model_providers", {}).get(DEEPSEEK_PROVIDER, {})
+    has_restore = (backup_dir() / "openai-last.toml").exists()
+    is_deepseek = provider == DEEPSEEK_PROVIDER
+
+    last_switch = None
+    if has_restore:
+        try:
+            restore_stat = (backup_dir() / "openai-last.toml").stat()
+            last_switch = datetime.fromtimestamp(restore_stat.st_mtime, tz=timezone.utc).isoformat()
+        except OSError:
+            pass
+
+    return {
+        "codex_home": str(codex_home()),
+        "model": model,
+        "provider": provider if provider else "openai",
+        "is_deepseek": is_deepseek,
+        "deepseek_configured": bool(deepseek),
+        "deepseek_base_url": deepseek.get("base_url") if deepseek else None,
+        "restore_available": has_restore,
+        "last_restore_point": last_switch,
+        "codex_running": is_codex_running(),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# History sync
+# --------------------------------------------------------------------------- #
+
+USER_TASKS_SQL = """
+SELECT id, rollout_path, model_provider, title
+FROM threads
+WHERE archived = 0
+  AND (thread_source = 'user' OR thread_source IS NULL OR thread_source = '')
+ORDER BY id
+"""
+
+
+def user_tasks(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(USER_TASKS_SQL).fetchall()
+    return [
+        {"id": r[0], "rollout_path": r[1], "provider": r[2], "title": r[3] or ""}
+        for r in rows
+    ]
+
+
+def current_provider_from_config() -> str | None:
+    parsed = parse_toml(load_text(config_path()))
+    return parsed.get("model_provider")
+
+
+def plan_sync(target: str) -> dict:
+    """Build a read-only plan of what a sync would change."""
+    db = state_db_path()
+    plan = {
+        "target_provider": target,
+        "state_db": str(db),
+        "state_db_exists": db.exists(),
+        "to_update": [],
+        "skipped": [],
+        "errors": [],
+        "session_index_missing_ids": [],
+    }
+    if not db.exists():
+        plan["errors"].append("state_5.sqlite not found; nothing to sync")
+        return plan
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        tasks = user_tasks(conn)
+    finally:
+        conn.close()
+
+    index_ids = set()
+    index_path = session_index_path()
+    if index_path.exists():
+        for line in index_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                index_ids.add(json.loads(line).get("id"))
+            except json.JSONDecodeError:
+                plan["errors"].append(f"session_index.jsonl has an unparseable line: {line[:80]}")
+
+    for task in tasks:
+        if task["provider"] == target:
+            continue
+        entry = {
+            "id": task["id"],
+            "provider": task["provider"],
+            "rollout_path": task["rollout_path"],
+        }
+        path = Path(task["rollout_path"]) if task["rollout_path"] else None
+        if path is None or not path.is_file():
+            entry["reason"] = "rollout file missing"
+            plan["skipped"].append(entry)
+            continue
+        ok, reason = validate_first_line(path, task["id"], task["provider"])
+        if not ok:
+            entry["reason"] = reason
+            plan["skipped"].append(entry)
+            continue
+        plan["to_update"].append(entry)
+        if task["id"] not in index_ids:
+            plan["session_index_missing_ids"].append(task["id"])
+    return plan
+
+
+def validate_first_line(path: Path, expected_id: str, expected_provider: str) -> tuple[bool, str]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return False, f"cannot read: {exc}"
+    nl = raw.find(b"\n")
+    if nl == -1:
+        return False, "no newline in rollout file"
+    first = raw[:nl]
+    try:
+        obj = json.loads(first.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False, "first line is not valid JSON"
+    payload = obj.get("payload") if isinstance(obj, dict) else None
+    if not isinstance(payload, dict):
+        return False, "session_meta payload missing"
+    if payload.get("id") != expected_id:
+        return False, "session_meta id mismatch"
+    if payload.get("model_provider") != expected_provider:
+        return False, (
+            f"first-line provider is {payload.get('model_provider')!r}, "
+            f"expected {expected_provider!r}"
+        )
+    return True, ""
+
+
+def new_first_line(path: Path, new_provider: str) -> str:
+    raw = path.read_bytes()
+    nl = raw.find(b"\n")
+    first = raw[:nl].decode("utf-8")
+    obj = json.loads(first)
+    old = obj["payload"]["model_provider"]
+    # Match the key plus the string value, regardless of spacing:
+    #   "model_provider":"openai"   (compact)  or
+    #   "model_provider": "openai"  (spaced)
+    marker = re.compile(r'"model_provider"\s*:\s*"([^"]*)"')
+    match = marker.search(first)
+    if not match:
+        raise ValueError("model_provider marker not found on first line")
+    if match.group(1) != old:
+        raise ValueError("model_provider value mismatch on first line")
+    updated = first[: match.start(1)] + new_provider + first[match.end(1) :]
+    parsed = json.loads(updated)
+    if parsed["payload"]["model_provider"] != new_provider:
+        raise ValueError("first-line rewrite did not change provider")
+    return updated
+
+
+def replace_first_line_bytes(path: Path, new_first_line: str) -> None:
+    raw = path.read_bytes()
+    nl = raw.find(b"\n")
+    if nl == -1:
+        raise ValueError("rollout file has no newline")
+    rest = raw[nl:]
+    path.write_bytes(new_first_line.encode("utf-8") + rest)
+
+
+def sync_history(target: str, dry_run: bool = False) -> dict:
+    """Sync history labels to ``target``. Returns a result dict."""
+    result = {
+        "target_provider": target,
+        "dry_run": dry_run,
+        "updated": 0,
+        "skipped": 0,
+        "errors": [],
+        "index_merged": 0,
+        "backup_dir": None,
+    }
+    db = state_db_path()
+    if not db.exists():
+        result["errors"].append("state_5.sqlite not found; nothing to sync")
+        return result
+
+    plan = plan_sync(target)
+    result["errors"] = list(plan["errors"])
+    to_update = plan["to_update"]
+    skipped = plan["skipped"]
+    result["skipped"] = len(skipped)
+    for entry in skipped:
+        print(f"  skip  {entry['id']}: {entry.get('reason', '?')}")
+
+    if dry_run:
+        result["updated"] = len(to_update)
+        return result
+
+    if is_codex_running():
+        result["errors"].append(
+            "Codex desktop is still running. Fully quit Codex, then rerun the sync."
+        )
+        return result
+
+    if not to_update:
+        return result
+
+    # ── backup ─────────────────────────────────────────────────────────────
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    snap = backup_dir() / f"sync-{stamp}"
+    snap.mkdir(parents=True, exist_ok=True)
+    result["backup_dir"] = str(snap)
+
+    manifest: dict[str, dict] = {}
+    try:
+        backup_conn = sqlite3.connect(db)
+        target_bak = snap / "state_5.sqlite.bak"
+        backup_target = sqlite3.connect(target_bak)
+        backup_conn.backup(backup_target)
+        backup_target.close()
+        backup_conn.close()
+    except Exception as exc:  # noqa: BLE001
+        result["errors"].append(f"database backup failed: {exc}")
+        return result
+
+    for entry in to_update:
+        path = Path(entry["rollout_path"])
+        try:
+            raw = path.read_bytes()
+            nl = raw.find(b"\n")
+            first_b64 = base64.b64encode(raw[:nl]).decode("ascii")
+            rest_sha = hashlib.sha256(raw[nl:]).hexdigest()
+        except OSError as exc:
+            result["errors"].append(f"cannot read rollout for backup {entry['id']}: {exc}")
+            continue
+        manifest[entry["id"]] = {
+            "path": str(path),
+            "first_line_b64": first_b64,
+            "rest_sha256": rest_sha,
+            "provider": entry["provider"],
+        }
+    (snap / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    # ── rewrite rollout first lines ────────────────────────────────────────
+    rewritten: list[str] = []
+    for entry in to_update:
+        path = Path(entry["rollout_path"])
+        try:
+            updated = new_first_line(path, target)
+            replace_first_line_bytes(path, updated)
+            rewritten.append(entry["id"])
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append(f"rollout rewrite failed for {entry['id']}: {exc}")
+
+    # ── update sqlite (only rows whose rollout was rewritten) ──────────────
+    if rewritten:
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            placeholders = ",".join("?" for _ in rewritten)
+            cur = conn.execute(
+                f"UPDATE threads SET model_provider = ? WHERE id IN ({placeholders})",
+                [target, *rewritten],
+            )
+            conn.commit()
+            result["updated"] = cur.rowcount
+        except Exception as exc:  # noqa: BLE001
+            conn.rollback()
+            result["errors"].append(f"database update failed: {exc}")
+            # Roll back rollout first lines already rewritten
+            for thread_id in rewritten:
+                info = manifest.get(thread_id)
+                if not info:
+                    continue
+                try:
+                    orig = base64.b64decode(info["first_line_b64"]).decode("utf-8")
+                    replace_first_line_bytes(Path(info["path"]), orig)
+                except Exception:  # noqa: BLE001
+                    result["errors"].append(
+                        f"rollback of {thread_id} failed; restore from {snap}"
+                    )
+        finally:
+            conn.close()
+
+    # ── merge missing ids into session_index.jsonl ─────────────────────────
+    missing = [tid for tid in plan["session_index_missing_ids"] if tid in rewritten]
+    if missing:
+        index_path = session_index_path()
+        lines = index_path.read_text(encoding="utf-8").splitlines() if index_path.exists() else []
+        known = set()
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                known.add(json.loads(line).get("id"))
+            except json.JSONDecodeError:
+                continue
+        title_map = {t["id"]: t["title"] for t in user_tasks(sqlite3.connect(db))}
+        added = []
+        for tid in missing:
+            if tid in known:
+                continue
+            added.append(
+                json.dumps(
+                    {
+                        "id": tid,
+                        "thread_name": title_map.get(tid) or "",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if added:
+            index_path.write_text(
+                "\n".join([*lines, *added]) + ("\n" if lines else ""),
+                encoding="utf-8",
+            )
+            result["index_merged"] = len(added)
+
+    return result
+
+
+def command_sync(args: argparse.Namespace) -> int:
+    target = args.target or current_provider_from_config()
+    if not target:
+        print("Cannot determine target provider (no --target and no config).", file=sys.stderr)
+        return 2
+
+    plan = plan_sync(target)
+    print(f"Target provider: {target}")
+    print(f"State db: {plan['state_db']}")
+    print(f"Tasks to relabel: {len(plan['to_update'])}")
+    print(f"Tasks skipped (need attention): {len(plan['skipped'])}")
+    for entry in plan["skipped"]:
+        print(f"  - {entry['id']} ({entry['provider']}): {entry.get('reason', '?')}")
+    for error in plan["errors"]:
+        print(f"ERROR: {error}", file=sys.stderr)
+
+    if args.dry_run:
+        print("Dry run: no files were changed.")
+        return 0
+
+    if plan["to_update"]:
+        if is_codex_running():
+            print(
+                "Codex desktop is still running.\n"
+                "Fully quit Codex (Cmd+Q), then run: codex-api-switch sync "
+                + (f"--target {target}" if args.target else ""),
+                file=sys.stderr,
+            )
+            return 3
+        if not args.yes:
+            answer = input(
+                f"Relabel {len(plan['to_update'])} conversation(s) to '{target}'? [y/N] "
+            ).strip().lower()
+            if answer not in ("y", "yes"):
+                print("Aborted.")
+                return 0
+
+    result = sync_history(target)
+    print(f"Updated: {result['updated']} conversations")
+    if result["index_merged"]:
+        print(f"session_index.jsonl: merged {result['index_merged']} missing id(s)")
+    if result["backup_dir"]:
+        print(f"Backup: {result['backup_dir']}")
+    for error in result["errors"]:
+        print(f"ERROR: {error}", file=sys.stderr)
+    return 1 if result["errors"] else 0
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+
+def command_deepseek(args: argparse.Namespace) -> int:
+    config_file = config_path()
+    if not config_file.exists():
+        print("Codex config.toml not found. Is Codex installed?", file=sys.stderr)
+        return 1
+
+    text = load_text(config_file)
+    parsed = parse_toml(text)
+
+    if parsed.get("model_provider") == DEEPSEEK_PROVIDER:
+        print("Already using DeepSeek.", file=sys.stderr)
+        return 0
+
+    token = args.api_key or existing_token(parsed)
+    if not token:
+        print(
+            "No DeepSeek API key found.\n"
+            "  Run: codex-api-switch deepseek --api-key 'sk-...'\n"
+            "  Or set DEEPSEEK_API_KEY environment variable.",
+            file=sys.stderr,
+        )
+        return 2
+    if not token.startswith("sk-"):
+        print(
+            "DeepSeek API key should start with 'sk-'. No files were changed.",
+            file=sys.stderr,
+        )
+        return 2
+
+    codex_home().mkdir(parents=True, exist_ok=True)
+    make_backup("before-deepseek")
+    save_restore_points()
+    config_file.write_text(render_deepseek_config(text, token), encoding="utf-8")
+    write_models_catalog()
+
+    print(f"Switched to DeepSeek ({DEEPSEEK_MODEL}).")
+    if args.no_sync:
+        print("History label sync skipped (--no-sync).")
+    elif is_codex_running():
+        print(
+            "NOTE: Codex desktop is still running, so history labels were NOT synced.\n"
+            "      Fully quit Codex (Cmd+Q), then run: codex-api-switch sync",
+        )
+    else:
+        result = sync_history(DEEPSEEK_PROVIDER)
+        if result["updated"]:
+            print(f"History synced: {result['updated']} conversation(s) relabeled to deepseek.")
+        elif not result["errors"]:
+            print("History labels already match deepseek.")
+        for error in result["errors"]:
+            print(f"ERROR: {error}", file=sys.stderr)
+        if result["backup_dir"]:
+            print(f"Backup: {result['backup_dir']}")
+    return 0
+
+
+def command_openai(args: argparse.Namespace) -> int:
+    restore_config = backup_dir() / "openai-last.toml"
+    if not restore_config.exists():
+        print(
+            "No OpenAI restore point found.\n"
+            "You must switch to DeepSeek at least once for a restore point to be created.",
+            file=sys.stderr,
+        )
+        return 2
+
+    config_file = config_path()
+    if not config_file.exists():
+        print("Codex config.toml not found.", file=sys.stderr)
+        return 1
+
+    parsed = parse_toml(load_text(config_file))
+    if parsed.get("model_provider") != DEEPSEEK_PROVIDER:
+        print("Already using OpenAI.", file=sys.stderr)
+        return 0
+
+    make_backup("before-openai")
+    shutil.copy2(restore_config, config_file)
+
+    if (backup_dir() / "models-last.json").exists():
+        shutil.copy2(backup_dir() / "models-last.json", models_path())
+    elif (backup_dir() / "models-was-absent").exists():
+        models_path().unlink(missing_ok=True)
+
+    openai_provider = parse_toml(load_text(config_file)).get("model_provider") or "openai"
+    print("Restored to OpenAI config.")
+    if args.no_sync:
+        print("History label sync skipped (--no-sync).")
+    elif is_codex_running():
+        print(
+            "NOTE: Codex desktop is still running, so history labels were NOT synced.\n"
+            "      Fully quit Codex (Cmd+Q), then run: codex-api-switch sync",
+        )
+    else:
+        result = sync_history(openai_provider)
+        if result["updated"]:
+            print(f"History synced: {result['updated']} conversation(s) relabeled to {openai_provider}.")
+        elif not result["errors"]:
+            print("History labels already match the OpenAI provider.")
+        for error in result["errors"]:
+            print(f"ERROR: {error}", file=sys.stderr)
+        if result["backup_dir"]:
+            print(f"Backup: {result['backup_dir']}")
+    return 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    text = load_text(config_path())
+    if not text.strip():
+        msg = "No config.toml found." if not args.json else json.dumps({"error": "no config"})
+        print(msg)
+        return 0
+
+    try:
+        parsed = parse_toml(text)
+    except Exception as exc:
+        if args.json:
+            print(json.dumps({"error": f"TOML parse error: {exc}"}))
+        else:
+            print(f"Config parse error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        status = get_status_dict()
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return 0
+
+    provider = parsed.get("model_provider") or "openai"
+    model = parsed.get("model", "(not set)")
+    deepseek = parsed.get("model_providers", {}).get(DEEPSEEK_PROVIDER, {})
+
+    print(f"Codex home: {codex_home()}")
+    print(f"Model: {model}")
+    print(f"Provider: {provider}")
+
+    if deepseek:
+        token = deepseek.get("experimental_bearer_token", "")
+        masked = token[:5] + "***" + token[-4:] if len(token) > 10 else "(set)"
+        print(f"DeepSeek URL: {deepseek.get('base_url', '(missing)')}")
+        print(f"DeepSeek key: {masked}")
+    else:
+        print("DeepSeek: not configured")
+
+    if (backup_dir() / "openai-last.toml").exists():
+        print("Restore point: available")
+    else:
+        print("Restore point: none (switch to DeepSeek first to create one)")
+
+    if is_codex_running():
+        print("Codex desktop: running (history sync requires quitting first)")
+    else:
+        print("Codex desktop: not running (history sync is safe)")
+    return 0
+
+
+def command_is_running(_: argparse.Namespace) -> int:
+    print("running" if is_codex_running() else "not-running")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codex-api-switch",
+        description="Switch Codex config between OpenAI and DeepSeek.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    deepseek = sub.add_parser("deepseek", help="Switch to DeepSeek (and sync history labels)")
+    deepseek.add_argument("--api-key", help="DeepSeek API key (starts with sk-)")
+    deepseek.add_argument("--no-sync", action="store_true", help="Do not relabel existing history")
+    deepseek.set_defaults(func=command_deepseek)
+
+    openai_cmd = sub.add_parser("openai", help="Restore OpenAI config (and sync history labels)")
+    openai_cmd.add_argument("--no-sync", action="store_true", help="Do not relabel existing history")
+    openai_cmd.set_defaults(func=command_openai)
+
+    sync = sub.add_parser("sync", help="Relabel history to the active provider")
+    sync.add_argument("--target", choices=[DEEPSEEK_PROVIDER, "openai"],
+                      help="Provider to relabel history to (default: current config)")
+    sync.add_argument("--dry-run", action="store_true", help="Only show what would change")
+    sync.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    sync.set_defaults(func=command_sync)
+
+    status = sub.add_parser("status", help="Show current provider")
+    status.add_argument("--json", action="store_true", help="Machine-readable JSON output")
+    status.set_defaults(func=command_status)
+
+    sub.add_parser("is-running", help="Print running/not-running for the desktop app").set_defaults(
+        func=command_is_running
+    )
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
