@@ -37,6 +37,20 @@ Codex 桌面端（及 `list_threads`）会按当前 `model_provider` 过滤任�
 
 要求 Python 3.9+（需要 `tomllib`，Python 3.11+ 内置；更早版本 `pip3 install tomli`）。
 
+### 方式一：一键安装（推荐）
+
+下载仓库后，在仓库根目录执行：
+
+```bash
+bash install.sh              # 安装 CLI 到 ~/.local/bin
+bash install.sh --app        # 顺便编译 macOS 桌面应用
+bash install.sh --prefix DIR # 安装到自定义目录
+```
+
+脚本会自动检查 Python 版本、安装缺失的 `tomli`、把 `codex-api-switch` 放进 PATH（并提示如果不在），可选编译桌面应用。
+
+### 方式二：手动安装
+
 ```bash
 # 1. 把 CLI 放进 PATH，例如：
 cp codex-api-switch ~/.local/bin/
@@ -51,6 +65,11 @@ cp deepseek-models.json ~/.local/bin/
 ```bash
 osacompile -l JavaScript -o "Codex API 切换.app" Codex_API_切换.app.js
 ```
+
+### 使用前的准备
+
+1. 本机已安装 Codex（工具操作的是 `~/.codex/` 下的配置与会话）。
+2. 准备一个 DeepSeek API Key：到 DeepSeek 开放平台注册并创建 `sk-` 开头的 Key。**工具不包含任何现成 Key**。
 
 ## 使用
 
