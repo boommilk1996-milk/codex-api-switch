@@ -761,6 +761,26 @@ def command_deepseek(args: argparse.Namespace) -> int:
     return 0
 
 
+def ensure_openai_provider(text: str) -> str:
+    """Make sure an OpenAI config explicitly declares model_provider = openai."""
+    if not text.strip():
+        return text
+    parsed = parse_toml(text)
+    if parsed.get("model_provider"):
+        return text
+    lines = text.splitlines()
+    insert_at = 0
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("model ") or stripped.startswith("model="):
+            insert_at = index + 1
+            break
+    lines.insert(insert_at, 'model_provider = "openai"')
+    rendered = "\n".join(lines).rstrip() + "\n"
+    parse_toml(rendered)  # fail loudly if the repair broke the file
+    return rendered
+
+
 def command_openai(args: argparse.Namespace) -> int:
     restore_config = backup_dir() / "openai-last.toml"
     if not restore_config.exists():
@@ -791,6 +811,15 @@ def command_openai(args: argparse.Namespace) -> int:
 
     make_backup("before-openai")
     shutil.copy2(restore_config, config_file)
+
+    # Self-heal: some older OpenAI restore points omit the explicit
+    # model_provider (OpenAI used to be the implicit default). Codex needs
+    # the field present, otherwise the restored config is incomplete.
+    restored_text = load_text(config_file)
+    fixed_text = ensure_openai_provider(restored_text)
+    if fixed_text != restored_text:
+        config_file.write_text(fixed_text, encoding="utf-8")
+        print("NOTE: restored OpenAI config was missing model_provider; repaired it.")
 
     if (backup_dir() / "models-last.json").exists():
         shutil.copy2(backup_dir() / "models-last.json", models_path())

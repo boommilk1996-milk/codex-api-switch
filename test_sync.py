@@ -349,6 +349,30 @@ def main() -> None:
                     "windows: ChatGPT.exe detected as running",
                 )
 
+        # 12. openai restore self-heals a restore point missing model_provider
+        with tempfile.TemporaryDirectory(prefix="codex-switch-heal-test-") as tmp3:
+            home3 = Path(tmp3)
+            setup_home(home3)
+            bak = home3 / "backups" / "codex-api-switch"
+            bak.mkdir(parents=True, exist_ok=True)
+            (bak / "openai-last.toml").write_text(
+                'model = "gpt-5.5"\nmodel_reasoning_effort = "medium"\n'
+            )
+            r = run("openai", home=home3)
+            check(
+                r.returncode == 0,
+                f"openai switch with broken restore point exit 0 (got {r.returncode})",
+            )
+            check(
+                "missing model_provider; repaired" in r.stdout,
+                "self-heal message printed",
+            )
+            cfg = (home3 / "config.toml").read_text(encoding="utf-8")
+            check('model_provider = "openai"' in cfg, "config repaired with model_provider")
+            r = run("status", "--json", home=home3)
+            st = json.loads(r.stdout)
+            check(st["provider"] == "openai", "status reports openai after repair")
+
     print("ALL TESTS PASSED")
 
 
