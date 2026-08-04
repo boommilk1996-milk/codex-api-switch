@@ -16,11 +16,22 @@ Codex 桌面端（及 `list_threads`）会按当前 `model_provider` 过滤任�
 
 切换回原来的服务商时再次执行同步即可，历史会跟着搬回去。
 
+## 为什么还需要 repair（array too long 报错）
+
+用第三方 API（如 DeepSeek）推进过的长会话，会话文件里记录的是**明文推理内容**（`reasoning` 项的 `content` 数组）。切回官方 Codex 后，续聊旧会话触发自动压缩（remote compact）时，官方 Responses API 要求 `reasoning` 项的 `content` 必须为空数组，于是报：
+
+```text
+Invalid 'input[7].content': array too long. Expected an array with maximum length 0, but got an array with length 1 instead.
+```
+
+这**不是对话丢失，也不是工具写坏文件**，只是历史消息格式与回放 API 不兼容。`repair` 会备份后把这类 `reasoning` 项的 `content` 清空（其余消息原样保留），会话即可继续推进。`openai` 切换命令会在 Codex 未运行时**自动执行修复**，无需手动干预。
+
 ## 功能
 
 - `deepseek`：切到 DeepSeek Responses API（自动写 `config.toml` 与模型目录）
-- `openai`：从恢复点还原 OpenAI 配置
+- `openai`：从恢复点还原 OpenAI 配置，并自动修复历史中的明文推理内容
 - `sync`：把全部用户主任务的历史标签同步为当前服务商（自动备份，可回滚）
+- `repair`：备份并清空会话文件里 `reasoning` 项的明文 `content`，修复 `array too long` 报错
 - `status` / `status --json`：查看当前配置与运行状态
 - `is-running`：检测 Codex 桌面端是否在运行
 - 桌面应用（JXA）：`Codex_API_切换.app.js` 编译成 macOS App，双击即可操作
@@ -29,8 +40,9 @@ Codex 桌面端（及 `list_threads`）会按当前 `model_provider` 过滤任�
 
 - **绝不读写、不打印 API Key**。DeepSeek Key 只通过 `--api-key` 参数或 `DEEPSEEK_API_KEY` 环境变量传入，写入 `config.toml` 后由你自行保管；`status` 输出仅显示掩码。
 - 同步前自动备份：SQLite 在线备份 + 每个将被修改会话文件第一行的 base64 清单，存于 `~/.codex/backups/codex-api-switch/sync-<时间戳>/`，可完整回滚。
+- 修复前自动备份：每个被修复的会话文件原样复制 + SHA-256 清单，存于 `~/.codex/backups/codex-api-switch/repair-<时间戳>/`，可完整回滚。
 - 只修改用户主任务（`thread_source` 为 `user`/空且未归档），子任务、评审、归档会话一律不动。
-- Codex 桌面端运行中**拒绝**修改历史（运行中的进程可能覆盖写入），会提示你先退出再同步。
+- Codex 桌面端运行中**拒绝**修改历史（运行中的进程可能覆盖写入），会提示你先退出再同步/修复。
 - 每次同步只改写会话文件第一行的 provider 字段，其余字节保持不变。
 
 ## 安装
@@ -72,7 +84,7 @@ osacompile -l JavaScript -o "Codex API 切换.app" Codex_API_切换.app.js
 2. 双击 `Codex API 切换.cmd` 打开菜单（或右键以 PowerShell 运行 `codex-api-switch-gui.ps1`）
 3. 按菜单操作：查看状态 / 切换服务商 / 同步历史 / 管理 Key
 
-CLI 在 Windows 上同样可用（`codex-api-switch status / deepseek / openai / sync / key`），进程检测会自动使用 `tasklist` 判断 Codex 是否运行。
+CLI 在 Windows 上同样可用（`codex-api-switch status / deepseek / openai / sync / key / repair`），进程检测会自动使用 `tasklist` 判断 Codex 是否运行。
 
 ### 使用前的准备
 
@@ -96,11 +108,16 @@ codex-api-switch key clear         # 忘记已保存的 Key
 # 完全退出 Codex 后，切到 DeepSeek（自动同步历史，Key 自动读取）
 codex-api-switch deepseek
 
-# 切回 OpenAI（同样自动同步历史）
+# 切回 OpenAI（自动同步历史 + 自动修复 reasoning 历史，防止 array too long）
 codex-api-switch openai
 
 # 只同步历史标签，不切换配置
 codex-api-switch sync
+
+# 排查 / 修复 array too long：
+codex-api-switch repair --all --dry-run   # 先只看哪些会话需要修复
+codex-api-switch repair <会话id>           # 修复指定会话（自动备份）
+codex-api-switch repair --all              # 修复全部受影响会话（自动备份）
 ```
 
 桌面应用使用流程：
@@ -119,9 +136,10 @@ DeepSeek API Key 保存在 `~/.codex/backups/codex-api-switch/deepseek-key`（�
 python3 test_sync.py
 ```
 
-测试在临时目录模拟完整的 Codex 目录结构，覆盖：dry-run、apply、幂等性、OpenAI ↔ DeepSeek 双向切换自动同步、子任务不动、索引合并、备份清单与回滚信息。
+测试在临时目录模拟完整的 Codex 目录结构，覆盖：dry-run、apply、幂等性、OpenAI ↔ DeepSeek 双向切换自动同步、子任务不动、索引合并、备份清单与回滚信息、`repair` 单会话/全部/幂等/运行中拒绝/切换自动修复。
 
 ## 已知边界
 
 - 同步是"换标签"不是复制：会话在某服务商标签下，就由该服务商显示与续聊；切回原服务商需再次同步。
+- `repair` 会清空旧会话里的明文推理内容，修复后该会话在官方 API 下可正常回放；DeepSeek 侧的续聊不依赖这些明文内容（推理内容由模型重新生成）。
 - 极早期的会话（老版本 Codex 创建）打开续聊时若遇兼容问题，可用 `~/.codex/backups/codex-api-switch/` 中的备份回滚。

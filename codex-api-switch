@@ -713,6 +713,254 @@ def command_sync(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# History repair (reasoning replay compatibility)
+# --------------------------------------------------------------------------- #
+#
+# Sessions advanced under a third-party provider (e.g. DeepSeek) store
+# plaintext reasoning content in their rollout files. When the conversation is
+# resumed after switching back to the official provider, the API rejects the
+# replayed history with 400 "Invalid 'input[i].content': array too long /
+# array_above_max_length" because reasoning items must have an empty content
+# array. The fix is to empty the content of those reasoning items.
+
+REASONING_TYPE = "reasoning"
+
+
+def all_rollout_paths() -> list[Path]:
+    """All rollout files: the sessions tree plus every path recorded in state db."""
+    paths: dict[Path, None] = {}
+    sessions_dir = codex_home() / "sessions"
+    if sessions_dir.is_dir():
+        for path in sessions_dir.rglob("rollout-*.jsonl"):
+            paths[path] = None
+    db = state_db_path()
+    if db.exists():
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                rows = conn.execute("SELECT rollout_path FROM threads").fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            rows = []
+        for (raw,) in rows:
+            if not raw:
+                continue
+            path = Path(raw).expanduser()
+            if path.is_file():
+                paths[path] = None
+    return sorted(paths)
+
+
+def resolve_rollout_path(session: str) -> Path:
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for path in all_rollout_paths():
+        if session in path.name and path not in seen:
+            candidates.append(path)
+            seen.add(path)
+    db = state_db_path()
+    if db.exists():
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                rows = conn.execute(
+                    "SELECT id, rollout_path FROM threads WHERE id = ? OR rollout_path LIKE ?",
+                    (session, f"%{session}%"),
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            rows = []
+        for _tid, raw in rows:
+            if not raw:
+                continue
+            path = Path(raw).expanduser()
+            if path.is_file() and path not in seen:
+                candidates.append(path)
+                seen.add(path)
+    if not candidates:
+        raise ValueError(
+            f"No rollout file matches session id '{session}'. "
+            "Pass the full session id (e.g. 019fcb99-1c6f-74c2-a5bb-f390a2013653)."
+        )
+    if len(candidates) > 1:
+        names = ", ".join(p.name for p in candidates[:5])
+        raise ValueError(f"Session id '{session}' matches multiple rollouts: {names}")
+    return candidates[0]
+
+
+def scan_reasoning(path: Path) -> tuple[int, int]:
+    """Return (total reasoning items, reasoning items with non-empty content)."""
+    total = 0
+    bad = 0
+    try:
+        lines = path.read_bytes().splitlines()
+    except OSError:
+        return 0, 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = obj.get("payload") if isinstance(obj, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") != REASONING_TYPE:
+            continue
+        total += 1
+        content = payload.get("content")
+        if isinstance(content, list) and content:
+            bad += 1
+    return total, bad
+
+
+def rewrite_reasoning_content(path: Path) -> int:
+    """Empty the content array of reasoning items. Returns how many changed."""
+    raw = path.read_bytes()
+    trailing_newline = raw.endswith(b"\n")
+    lines = raw.splitlines()
+    out: list[bytes] = []
+    changed = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            out.append(line)
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            out.append(line)
+            continue
+        payload = obj.get("payload") if isinstance(obj, dict) else None
+        if not isinstance(payload, dict) or payload.get("type") != REASONING_TYPE:
+            out.append(line)
+            continue
+        content = payload.get("content")
+        if not (isinstance(content, list) and content):
+            out.append(line)
+            continue
+        payload["content"] = []
+        out.append(json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        changed += 1
+    new_raw = b"\n".join(out) + (b"\n" if trailing_newline else b"")
+    path.write_bytes(new_raw)
+    return changed
+
+
+def backup_rollouts(paths: list[Path]) -> Path:
+    """Copy rollout files (plus a sha256 manifest) into a repair-<ts> snapshot."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    snap = backup_dir() / f"repair-{stamp}"
+    snap.mkdir(parents=True, exist_ok=True)
+    manifest: dict[str, dict] = {}
+    for path in paths:
+        rel = path.relative_to(codex_home())
+        target = snap / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        manifest[str(path)] = {
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "backup": str(target),
+        }
+    (snap / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return snap
+
+
+def scan_all_rollouts() -> list[tuple[Path, int, int]]:
+    """Return (path, total, bad) for every rollout that needs repair."""
+    plan = []
+    for path in all_rollout_paths():
+        total, bad = scan_reasoning(path)
+        if bad:
+            plan.append((path, total, bad))
+    return plan
+
+
+def apply_repairs(plan: list[tuple[Path, int, int]]) -> tuple[Path, int]:
+    """Back up and repair every rollout in ``plan``. Returns (backup_dir, changed)."""
+    snap = backup_rollouts([path for path, _, _ in plan])
+    changed = 0
+    for path, _total, bad in plan:
+        repaired = rewrite_reasoning_content(path)
+        changed += repaired
+        if repaired != bad:
+            raise ValueError(f"{path.name}: expected {bad} changes, applied {repaired}")
+    return snap, changed
+
+
+def command_repair(args: argparse.Namespace) -> int:
+    if args.all and args.session:
+        print("Specify either a session id or --all, not both.", file=sys.stderr)
+        return 2
+    if not args.all and not args.session:
+        print("Specify a session id or --all.", file=sys.stderr)
+        return 2
+
+    if args.all:
+        plan = scan_all_rollouts()
+    else:
+        try:
+            path = resolve_rollout_path(args.session)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        total, bad = scan_reasoning(path)
+        plan = [(path, total, bad)] if bad else []
+
+    print(f"Sessions scanned: {len(all_rollout_paths()) if args.all else 1}")
+    print(f"Sessions to repair: {len(plan)}")
+    for path, total, bad in plan:
+        print(
+            f"  {path.name}: {bad} reasoning item(s) with content to empty "
+            f"(of {total} reasoning item(s))"
+        )
+
+    if args.dry_run or not plan:
+        if args.dry_run:
+            print("Dry run: no files were changed.")
+        return 0
+
+    if is_codex_running() and not args.force:
+        print(
+            "Codex desktop is still running.\n"
+            "Fully quit Codex (Cmd+Q), then run: codex-api-switch repair "
+            + ("--all" if args.all else args.session),
+            file=sys.stderr,
+        )
+        return 3
+
+    if not args.yes:
+        answer = input(
+            f"Empty reasoning content in {len(plan)} session(s)? "
+            "A backup is created first. [y/N] "
+        ).strip().lower()
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return 0
+
+    try:
+        snap, changed = apply_repairs(plan)
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: repair failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Repaired: {changed} reasoning item(s) in {len(plan)} session(s)")
+    print(f"Backup: {snap}")
+    remaining = sum(scan_reasoning(path)[1] for path, _, _ in plan)
+    if remaining:
+        print(f"WARNING: {remaining} reasoning item(s) still have content", file=sys.stderr)
+        return 1
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
 
@@ -779,6 +1027,10 @@ def command_deepseek(args: argparse.Namespace) -> int:
             print(f"ERROR: {error}", file=sys.stderr)
         if result["backup_dir"]:
             print(f"Backup: {result['backup_dir']}")
+    print(
+        "Hint: if a resumed session reports 'array too long' after a later switch back to OpenAI,\n"
+        "      run: codex-api-switch repair <session-id>   (or: repair --all)"
+    )
     return 0
 
 
@@ -851,6 +1103,27 @@ def command_openai(args: argparse.Namespace) -> int:
 
     openai_provider = parse_toml(load_text(config_file)).get("model_provider") or "openai"
     print("Restored to OpenAI config.")
+    if args.no_repair:
+        print("History reasoning repair skipped (--no-repair).")
+    elif is_codex_running():
+        print(
+            "NOTE: Codex desktop is still running, so session history repair was NOT run.\n"
+            "      Fully quit Codex (Cmd+Q), then run: codex-api-switch repair --all",
+        )
+    else:
+        repair_plan = scan_all_rollouts()
+        if repair_plan:
+            try:
+                snap, changed = apply_repairs(repair_plan)
+            except Exception as exc:  # noqa: BLE001
+                print(f"ERROR: session history repair failed: {exc}", file=sys.stderr)
+            else:
+                print(
+                    f"Repaired {len(repair_plan)} session(s), {changed} reasoning item(s) "
+                    f"(backup: {snap})."
+                )
+        else:
+            print("No session history needs repair for the OpenAI switch.")
     if args.no_sync:
         print("History label sync skipped (--no-sync).")
     elif is_codex_running():
@@ -962,6 +1235,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     openai_cmd = sub.add_parser("openai", help="Restore OpenAI config (and sync history labels)")
     openai_cmd.add_argument("--no-sync", action="store_true", help="Do not relabel existing history")
+    openai_cmd.add_argument(
+        "--no-repair",
+        action="store_true",
+        help="Do not empty plaintext reasoning content in session history",
+    )
     openai_cmd.set_defaults(func=command_openai)
 
     sync = sub.add_parser("sync", help="Relabel history to the active provider")
@@ -970,6 +1248,25 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--dry-run", action="store_true", help="Only show what would change")
     sync.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
     sync.set_defaults(func=command_sync)
+
+    repair = sub.add_parser(
+        "repair",
+        help="Fix sessions that fail with 'array too long' after switching providers",
+    )
+    repair.add_argument(
+        "session",
+        nargs="?",
+        help="Session id or rollout filename to repair (or use --all)",
+    )
+    repair.add_argument("--all", action="store_true", help="Repair every affected rollout")
+    repair.add_argument("--dry-run", action="store_true", help="Only show what would change")
+    repair.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    repair.add_argument(
+        "--force",
+        action="store_true",
+        help="Proceed even while Codex is running (changes apply after restart)",
+    )
+    repair.set_defaults(func=command_repair)
 
     key = sub.add_parser(
         "key",

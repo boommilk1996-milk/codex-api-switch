@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import base64
+import argparse
 import os
 import platform
 import sqlite3
@@ -44,6 +45,62 @@ def make_rollout(path: Path, thread_id: str, provider: str) -> None:
         + "\n"
     )
     path.write_text(first + "\n" + body, encoding="utf-8")
+
+
+def add_reasoning_history(path: Path, count: int = 3) -> None:
+    """Append response_item lines with plaintext reasoning content (DeepSeek-era shape)."""
+    lines = []
+    for i in range(count):
+        lines.append(
+            json.dumps(
+                {
+                    "timestamp": "2026-08-03T00:00:0X.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "reasoning",
+                        "id": f"reasoning-{i}",
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": f"thinking {i}"}],
+                        "encrypted_content": None,
+                    },
+                },
+                ensure_ascii=False,
+            )
+        )
+    lines.append(
+        json.dumps(
+            {
+                "timestamp": "2026-08-03T00:00:00.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "reasoning",
+                    "id": "reasoning-empty",
+                    "summary": [],
+                    "content": [],
+                    "encrypted_content": None,
+                },
+            },
+            ensure_ascii=False,
+        )
+    )
+    lines.append(
+        json.dumps(
+            {
+                "timestamp": "2026-08-03T00:00:00.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "id": "call-1",
+                    "name": "exec_command",
+                    "arguments": "{}",
+                    "call_id": "call_00_x",
+                },
+            },
+            ensure_ascii=False,
+        )
+    )
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 
 def setup_home(home: Path) -> None:
@@ -402,6 +459,112 @@ def main() -> None:
                 )
             )
             check(len(cache_baks) == 1, "cache backed up before removal")
+
+        # 14. repair subcommand empties reasoning content (array_above_max_length fix)
+        with tempfile.TemporaryDirectory(prefix="codex-switch-repair-test-") as tmp5:
+            home5 = Path(tmp5)
+            setup_home(home5)
+            a_path = home5 / "rollout-a.jsonl"
+            c_path = home5 / "rollout-c.jsonl"
+            add_reasoning_history(a_path, 3)
+            add_reasoning_history(c_path, 1)
+
+            # dry-run: reports both sessions, changes nothing
+            r = run("repair", "--all", "--dry-run", home=home5)
+            check(r.returncode == 0, f"repair --all --dry-run exit 0 (got {r.returncode})")
+            check("Sessions to repair: 2" in r.stdout, "dry-run finds 2 sessions")
+            check("Dry run: no files were changed." in r.stdout, "repair dry-run changes nothing")
+            after_dry = a_path.read_text(encoding="utf-8")
+            check('"text": "thinking 0"' in after_dry, "dry-run left reasoning content intact")
+
+            # repair one session by id
+            r = run("repair", "task-aaa", "-y", home=home5)
+            check(r.returncode == 0, f"repair by id exit 0 (got {r.returncode}, {r.stderr})")
+            check("Repaired: 3 reasoning item(s) in 1 session(s)" in r.stdout, "repair reports 3 items")
+            check("Backup:" in r.stdout, "repair reports backup")
+            a_text = a_path.read_text(encoding="utf-8")
+            check('"text": "thinking 0"' not in a_text, "reasoning text removed")
+            check('"content":[]' in a_text, "reasoning content emptied")
+            check('"type": "function_call"' in a_text, "function_call item untouched")
+            check('"type": "user_message"' in a_text, "message items untouched")
+            check('"id": "reasoning-empty"' in a_text, "already-empty reasoning kept")
+            check(
+                '"model_provider": "openai"' in a_text.split("\n")[0],
+                "session_meta first line untouched by repair",
+            )
+
+            # backup snapshot exists with manifest
+            repair_baks = sorted(
+                (home5 / "backups" / "codex-api-switch").glob("repair-*"),
+                key=lambda p: p.name,
+            )
+            check(len(repair_baks) == 1, "one repair backup snapshot")
+            manifest = json.loads(
+                (repair_baks[0] / "manifest.json").read_text(encoding="utf-8")
+            )
+            check(str(a_path) in manifest, "manifest covers repaired rollout")
+            check(
+                (repair_baks[0] / "rollout-a.jsonl").exists(),
+                "backup keeps a copy of the rollout",
+            )
+
+            # idempotent
+            r = run("repair", "task-aaa", "-y", home=home5)
+            check(r.returncode == 0, "second repair exit 0")
+            check("Sessions to repair: 0" in r.stdout, "second repair is a no-op")
+
+            # --all repairs the remaining session
+            r = run("repair", "--all", "-y", home=home5)
+            check(r.returncode == 0, "repair --all exit 0")
+            check("Repaired: 1 reasoning item(s) in 1 session(s)" in r.stdout, "repair --all fixes remaining")
+            c_text = c_path.read_text(encoding="utf-8")
+            check('"text": "thinking 0"' not in c_text, "second session reasoning emptied")
+
+            # unknown session id
+            r = run("repair", "no-such-session", "-y", home=home5)
+            check(r.returncode == 1, "unknown session id exits 1")
+            check("No rollout file matches" in r.stderr, "unknown id error message")
+
+            # refuses while Codex is running unless --force
+            import types as repair_types
+
+            add_reasoning_history(a_path, 1)
+            mod5 = repair_types.ModuleType("codex_api_switch_repair_mod")
+            mod5.__file__ = str(SWITCHER)
+            with open(SWITCHER, encoding="utf-8") as fh:
+                exec(compile(fh.read(), str(SWITCHER), "exec"), mod5.__dict__)
+            with mock.patch.dict(os.environ, {"CODEX_SWITCH_HOME": str(home5)}):
+                with mock.patch.object(mod5, "is_codex_running", return_value=True):
+                    ns = argparse.Namespace(
+                        all=False, session="task-aaa", dry_run=False, yes=True, force=False
+                    )
+                    check(mod5.command_repair(ns) == 3, "repair refuses while running")
+                with mock.patch.object(mod5, "is_codex_running", return_value=True):
+                    ns = argparse.Namespace(
+                        all=False, session="task-aaa", dry_run=False, yes=True, force=True
+                    )
+                    check(mod5.command_repair(ns) == 0, "repair --force proceeds while running")
+
+        # 15. switching back to OpenAI auto-repairs session history
+        with tempfile.TemporaryDirectory(prefix="codex-switch-openai-repair-test-") as tmp6:
+            home6 = Path(tmp6)
+            setup_home(home6)
+            a_path = home6 / "rollout-a.jsonl"
+            add_reasoning_history(a_path, 2)
+            bak = home6 / "backups" / "codex-api-switch"
+            bak.mkdir(parents=True, exist_ok=True)
+            (bak / "openai-last.toml").write_text(
+                'model_provider = "openai"\nmodel = "gpt-5.5"\n'
+            )
+            r = run("openai", home=home6)
+            check(r.returncode == 0, f"openai switch with auto-repair exit 0 (got {r.returncode})")
+            check("Repaired 1 session(s), 2 reasoning item(s)" in r.stdout, "auto-repair reported")
+            a_text = a_path.read_text(encoding="utf-8")
+            check('"text": "thinking 0"' not in a_text, "auto-repair emptied reasoning content")
+            cfg = (home6 / "config.toml").read_text(encoding="utf-8")
+            check('model_provider = "openai"' in cfg, "config switched to openai")
+            r = run("openai", home=home6)
+            check("Already using OpenAI." in r.stderr, "second switch is a no-op")
 
     print("ALL TESTS PASSED")
 
