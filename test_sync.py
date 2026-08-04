@@ -373,6 +373,36 @@ def main() -> None:
             st = json.loads(r.stdout)
             check(st["provider"] == "openai", "status reports openai after repair")
 
+        # 13. provider switch clears the stale Codex model cache
+        with tempfile.TemporaryDirectory(prefix="codex-switch-cache-test-") as tmp4:
+            home4 = Path(tmp4)
+            setup_home(home4)
+            (home4 / "config.toml").write_text('model_provider = "openai"\nmodel = "gpt-5.5"\n')
+            cache = home4 / "models_cache.json"
+            cache.write_text('{"models":[{"slug":"gpt-5.6-sol"}]}\n', encoding="utf-8")
+            env4 = dict(os.environ)
+            env4["CODEX_SWITCH_HOME"] = str(home4)
+            env4["DEEPSEEK_API_KEY"] = "sk-test-1234567890"
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "deepseek"],
+                capture_output=True, text=True, env=env4,
+            )
+            check(
+                r.returncode == 0,
+                f"deepseek switch with stale cache exit 0 (got {r.returncode})",
+            )
+            check(
+                "Removed stale Codex model cache" in r.stdout,
+                "cache removal message printed",
+            )
+            check(not cache.exists(), "stale cache file removed")
+            cache_baks = list(
+                (home4 / "backups" / "codex-api-switch").glob(
+                    "models_cache-removed-*.json"
+                )
+            )
+            check(len(cache_baks) == 1, "cache backed up before removal")
+
     print("ALL TESTS PASSED")
 
 

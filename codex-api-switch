@@ -264,6 +264,25 @@ def clear_deepseek_key() -> None:
     key_store_path().unlink(missing_ok=True)
 
 
+def clear_stale_model_cache() -> bool:
+    """Back up and remove Codex's provider model cache after a switch.
+
+    Codex desktop keeps models_cache.json fetched from the previous
+    provider; after switching it can still show/select old model names
+    (e.g. gpt-5.6-sol) and send them to the new provider. Removing the
+    cache makes Codex reload models for the active provider on restart.
+    Returns True when a cache file was removed.
+    """
+    path = codex_home() / "models_cache.json"
+    if not path.exists():
+        return False
+    backup_dir().mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(path, backup_dir() / f"models_cache-removed-{stamp}.json")
+    path.unlink()
+    return True
+
+
 def masked_key(token: str | None) -> str:
     if not token:
         return "(not set)"
@@ -738,6 +757,8 @@ def command_deepseek(args: argparse.Namespace) -> int:
     config_file.write_text(render_deepseek_config(text, token), encoding="utf-8")
     write_models_catalog()
     save_deepseek_key(token)
+    if clear_stale_model_cache():
+        print("Removed stale Codex model cache (restart Codex to reload model list).")
 
     print(f"Switched to DeepSeek ({DEEPSEEK_MODEL}).")
     print("DeepSeek API key saved for future switches (codex-api-switch key status).")
@@ -825,6 +846,8 @@ def command_openai(args: argparse.Namespace) -> int:
         shutil.copy2(backup_dir() / "models-last.json", models_path())
     elif (backup_dir() / "models-was-absent").exists():
         models_path().unlink(missing_ok=True)
+    if clear_stale_model_cache():
+        print("Removed stale Codex model cache (restart Codex to reload model list).")
 
     openai_provider = parse_toml(load_text(config_file)).get("model_provider") or "openai"
     print("Restored to OpenAI config.")
