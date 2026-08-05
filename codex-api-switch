@@ -373,7 +373,7 @@ def get_status_dict() -> dict:
 # --------------------------------------------------------------------------- #
 
 USER_TASKS_SQL = """
-SELECT id, rollout_path, model_provider, title
+SELECT id, rollout_path, model_provider, title, model
 FROM threads
 WHERE archived = 0
   AND (thread_source = 'user' OR thread_source IS NULL OR thread_source = '')
@@ -384,7 +384,7 @@ ORDER BY id
 def user_tasks(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(USER_TASKS_SQL).fetchall()
     return [
-        {"id": r[0], "rollout_path": r[1], "provider": r[2], "title": r[3] or ""}
+        {"id": r[0], "rollout_path": r[1], "provider": r[2], "title": r[3] or "", "model": r[4]}
         for r in rows
     ]
 
@@ -392,6 +392,110 @@ def user_tasks(conn: sqlite3.Connection) -> list[dict]:
 def current_provider_from_config() -> str | None:
     parsed = parse_toml(load_text(config_path()))
     return parsed.get("model_provider")
+
+
+def target_default_model(target: str) -> str | None:
+    """Model to relabel sessions to when syncing to ``target``."""
+    if target == DEEPSEEK_PROVIDER:
+        return DEEPSEEK_MODEL
+    restore = backup_dir() / "openai-last.toml"
+    if not restore.exists():
+        return None
+    try:
+        parsed = parse_toml(restore.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    return parsed.get("model") or None
+
+
+def rewrite_session_model_fields(obj: dict, new_model: str, new_provider: str) -> int:
+    """Rewrite model-related fields inside a parsed rollout JSON object.
+
+    Returns how many fields changed. The rollout JSON keeps its structure;
+    only the session-level model settings are rebind to the target provider so
+    the desktop app stops sending the old provider's model name.
+    """
+    changed = 0
+    payload = obj.get("payload")
+    if not isinstance(payload, dict):
+        return 0
+
+    def set_model(o: dict, keys: tuple[str, ...], value: str) -> bool:
+        nonlocal changed
+        if isinstance(o, dict) and all(k in o for k in keys):
+            if o.get(keys[-1]) != value:
+                o[keys[-1]] = value
+                changed += 1
+            return True
+        return False
+
+    ts = payload.get("thread_settings")
+    if isinstance(ts, dict):
+        if set_model(ts, ("model",), new_model):
+            pass
+        if ts.get("model_provider_id") != new_provider:
+            ts["model_provider_id"] = new_provider
+            changed += 1
+        collab = ts.get("collaboration_mode")
+        if isinstance(collab, dict):
+            s = collab.get("settings")
+            if isinstance(s, dict):
+                set_model(s, ("model",), new_model)
+
+    cm = payload.get("collaboration_mode")
+    if isinstance(cm, dict):
+        s = cm.get("settings")
+        if isinstance(s, dict):
+            set_model(s, ("model",), new_model)
+
+    state = payload.get("state")
+    if isinstance(state, dict):
+        set_model(state, ("model",), new_model)
+        personality = state.get("personality")
+        if isinstance(personality, dict):
+            set_model(personality, ("model",), new_model)
+
+    # turn_context keeps a per-turn model record; rebind it too so the app
+    # never replays the old model name when resuming the thread.
+    set_model(payload, ("model",), new_model)
+    return changed
+
+
+def rewrite_session_model_file(path: Path, new_model: str, new_provider: str) -> int:
+    """Rewrite model-related fields in every JSON line of a rollout file.
+
+    Returns the total number of field changes across the file. Lines that do
+    not parse or contain no model fields are kept byte-for-byte.
+    """
+    raw = path.read_bytes()
+    trailing_newline = raw.endswith(b"\n")
+    lines = raw.splitlines()
+    out: list[bytes] = []
+    total_changed = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            out.append(line)
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            out.append(line)
+            continue
+        if not isinstance(obj, dict):
+            out.append(line)
+            continue
+        changed = rewrite_session_model_fields(obj, new_model, new_provider)
+        if changed:
+            out.append(
+                json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            )
+            total_changed += changed
+        else:
+            out.append(line)
+    new_raw = b"\n".join(out) + (b"\n" if trailing_newline else b"")
+    path.write_bytes(new_raw)
+    return total_changed
 
 
 def plan_sync(target: str) -> dict:
@@ -434,6 +538,7 @@ def plan_sync(target: str) -> dict:
             "id": task["id"],
             "provider": task["provider"],
             "rollout_path": task["rollout_path"],
+            "model": task.get("model"),
         }
         path = Path(task["rollout_path"]) if task["rollout_path"] else None
         if path is None or not path.is_file():
@@ -512,8 +617,10 @@ def sync_history(target: str, dry_run: bool = False) -> dict:
     """Sync history labels to ``target``. Returns a result dict."""
     result = {
         "target_provider": target,
+        "target_model": target_default_model(target),
         "dry_run": dry_run,
         "updated": 0,
+        "models_relabeled": 0,
         "skipped": 0,
         "errors": [],
         "index_merged": 0,
@@ -528,12 +635,20 @@ def sync_history(target: str, dry_run: bool = False) -> dict:
     result["errors"] = list(plan["errors"])
     to_update = plan["to_update"]
     skipped = plan["skipped"]
+    new_model = result["target_model"]
+    if new_model is None:
+        result["errors"].append(
+            "Cannot determine the target model (missing restore point for OpenAI); "
+            "provider labels will still sync."
+        )
     result["skipped"] = len(skipped)
     for entry in skipped:
         print(f"  skip  {entry['id']}: {entry.get('reason', '?')}")
 
     if dry_run:
         result["updated"] = len(to_update)
+        if new_model:
+            result["models_relabeled"] = len(to_update)
         return result
 
     if is_codex_running():
@@ -578,6 +693,7 @@ def sync_history(target: str, dry_run: bool = False) -> dict:
             "first_line_b64": first_b64,
             "rest_sha256": rest_sha,
             "provider": entry["provider"],
+            "model": entry.get("model"),
         }
     (snap / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -591,6 +707,8 @@ def sync_history(target: str, dry_run: bool = False) -> dict:
         try:
             updated = new_first_line(path, target)
             replace_first_line_bytes(path, updated)
+            if new_model:
+                rewrite_session_model_file(path, new_model, target)
             rewritten.append(entry["id"])
         except Exception as exc:  # noqa: BLE001
             result["errors"].append(f"rollout rewrite failed for {entry['id']}: {exc}")
@@ -601,12 +719,22 @@ def sync_history(target: str, dry_run: bool = False) -> dict:
         try:
             conn.execute("BEGIN IMMEDIATE")
             placeholders = ",".join("?" for _ in rewritten)
+            if new_model:
+                sql = (
+                    f"UPDATE threads SET model_provider = ?, model = ? "
+                    f"WHERE id IN ({placeholders})"
+                )
+                params: list = [target, new_model, *rewritten]
+            else:
+                sql = f"UPDATE threads SET model_provider = ? WHERE id IN ({placeholders})"
+                params = [target, *rewritten]
             cur = conn.execute(
-                f"UPDATE threads SET model_provider = ? WHERE id IN ({placeholders})",
-                [target, *rewritten],
+                sql, params
             )
             conn.commit()
             result["updated"] = cur.rowcount
+            if new_model:
+                result["models_relabeled"] = len(rewritten)
         except Exception as exc:  # noqa: BLE001
             conn.rollback()
             result["errors"].append(f"database update failed: {exc}")
@@ -703,6 +831,8 @@ def command_sync(args: argparse.Namespace) -> int:
 
     result = sync_history(target)
     print(f"Updated: {result['updated']} conversations")
+    if result["models_relabeled"]:
+        print(f"Models relabeled: {result['models_relabeled']} conversation(s) -> {result['target_model']}")
     if result["index_merged"]:
         print(f"session_index.jsonl: merged {result['index_merged']} missing id(s)")
     if result["backup_dir"]:

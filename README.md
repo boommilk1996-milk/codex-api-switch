@@ -8,13 +8,13 @@
 
 Codex 桌面端（及 `list_threads`）会按当前 `model_provider` 过滤任务列表。切换服务商后，之前在其他服务商下创建的会话会从侧边栏"消失"——**数据并没有丢**，只是被过滤隐藏了（相关 issue：openai/codex #31625，官方尚未修复）。
 
-本工具的 `sync` 功能把历史会话的 `model_provider` 标签统一改成当前服务商，并保持三处元数据一致：
+本工具的 `sync` 功能把历史会话的 `model_provider` 标签统一改成当前服务商，同时把会话级模型设置一并改成目标模型（如 `gpt-5.5` → `deepseek-v4-flash`），并保持元数据一致：
 
 1. `state_5.sqlite` 的 `threads.model_provider`（桌面端列表过滤依据）
 2. 会话 JSONL 文件第一行 `session_meta.payload.model_provider`（Codex 重启后会用它重建数据库，只改这里才不会被覆盖）
 3. `session_index.jsonl`（缺失的任务 ID 合并进去）
 
-切换回原来的服务商时再次执行同步即可，历史会跟着搬回去。
+切换回原来的服务商时再次执行同步即可，历史会跟着搬回去，模型也会还原为 OpenAI 默认模型（避免续聊时把旧模型名发给新服务商）。
 
 ## 为什么还需要 repair（array too long 报错）
 
@@ -30,7 +30,7 @@ Invalid 'input[7].content': array too long. Expected an array with maximum lengt
 
 - `deepseek`：切到 DeepSeek Responses API（自动写 `config.toml` 与模型目录）
 - `openai`：从恢复点还原 OpenAI 配置，并自动修复历史中的明文推理内容
-- `sync`：把全部用户主任务的历史标签同步为当前服务商（自动备份，可回滚）
+- `sync`：把全部用户主任务的历史标签同步为当前服务商，并同步会话级模型（自动备份，可回滚）
 - `repair`：备份并清空会话文件里 `reasoning` 项的明文 `content`，修复 `array too long` 报错
 - `status` / `status --json`：查看当前配置与运行状态
 - `is-running`：检测 Codex 桌面端是否在运行
@@ -44,6 +44,7 @@ Invalid 'input[7].content': array too long. Expected an array with maximum lengt
 - 只修改用户主任务（`thread_source` 为 `user`/空且未归档），子任务、评审、归档会话一律不动。
 - Codex 桌面端运行中**拒绝**修改历史（运行中的进程可能覆盖写入），会提示你先退出再同步/修复。
 - 每次同步只改写会话文件第一行的 provider 字段，其余字节保持不变。
+- 同步会话模型时只改写 `thread_settings.model` / `model_provider_id`、`state` 与 `turn_context` 中的模型字段，消息内容一律不动。
 
 ## 安装
 
@@ -140,6 +141,6 @@ python3 test_sync.py
 
 ## 已知边界
 
-- 同步是"换标签"不是复制：会话在某服务商标签下，就由该服务商显示与续聊；切回原服务商需再次同步。
+- 同步是"换标签"不是复制：会话在某服务商标签下，就由该服务商显示与续聊；切回原服务商需再次同步（模型会同时还原为 OpenAI 默认模型）。
 - `repair` 会清空旧会话里的明文推理内容，修复后该会话在官方 API 下可正常回放；DeepSeek 侧的续聊不依赖这些明文内容（推理内容由模型重新生成）。
 - 极早期的会话（老版本 Codex 创建）打开续聊时若遇兼容问题，可用 `~/.codex/backups/codex-api-switch/` 中的备份回滚。

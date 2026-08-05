@@ -103,6 +103,47 @@ def add_reasoning_history(path: Path, count: int = 3) -> None:
         fh.write("\n".join(lines) + "\n")
 
 
+def add_session_settings(path: Path, model: str, provider_id: str = "openai") -> None:
+    """Append thread_settings / world_state / turn_context lines carrying a model."""
+    lines = [
+        json.dumps(
+            {
+                "timestamp": "2026-08-03T00:00:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_settings_applied",
+                    "thread_settings": {
+                        "model": model,
+                        "model_provider_id": provider_id,
+                        "approval_policy": "on-request",
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
+                "timestamp": "2026-08-03T00:00:00.000Z",
+                "type": "world_state",
+                "payload": {
+                    "state": {"model": model, "personality": {"model": model}},
+                },
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
+                "timestamp": "2026-08-03T00:00:00.000Z",
+                "type": "turn_context",
+                "payload": {"turn_id": "t-1", "model": model},
+            },
+            ensure_ascii=False,
+        ),
+    ]
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
 def setup_home(home: Path) -> None:
     (home / "ipc").mkdir(parents=True)
     (home / "backups" / "codex-api-switch").mkdir(parents=True)
@@ -565,6 +606,80 @@ def main() -> None:
             check('model_provider = "openai"' in cfg, "config switched to openai")
             r = run("openai", home=home6)
             check("Already using OpenAI." in r.stderr, "second switch is a no-op")
+
+        # 16. sync relabels the session-level model too (gpt -> deepseek)
+        with tempfile.TemporaryDirectory(prefix="codex-switch-model-test-") as tmp7:
+            home7 = Path(tmp7)
+            setup_home(home7)
+            a_path = home7 / "rollout-a.jsonl"
+            add_session_settings(a_path, "gpt-5.5", "openai")
+
+            r = run("sync", "--target", "deepseek", "--yes", home=home7)
+            check(r.returncode == 0, f"sync with model relabel exit 0 (got {r.returncode}, {r.stderr})")
+            check(
+                "Models relabeled: 2 conversation(s) -> deepseek-v4-flash" in r.stdout,
+                "sync reports model relabel",
+            )
+            a_text = a_path.read_text(encoding="utf-8")
+            check(
+                '"model":"deepseek-v4-flash"' in a_text
+                and '"model_provider_id":"deepseek"' in a_text,
+                "thread_settings model/provider rewritten",
+            )
+            check(
+                '"personality":{"model":"deepseek-v4-flash"}' in a_text,
+                "world_state personality model rewritten",
+            )
+            conn = sqlite3.connect(home7 / "state_5.sqlite")
+            rows = {
+                r[0]: (r[1], r[2])
+                for r in conn.execute(
+                    "SELECT id, model_provider, model FROM threads"
+                ).fetchall()
+            }
+            conn.close()
+            check(
+                rows["task-aaa"] == ("deepseek", "deepseek-v4-flash"),
+                "sqlite provider+model updated for gpt session",
+            )
+            check(
+                rows["task-ccc"] == ("deepseek", None) or rows["task-ccc"][1] is None,
+                "deepseek session model untouched (no old model to fix)",
+            )
+
+            # idempotent: second sync is a no-op
+            r = run("sync", "--target", "deepseek", "--yes", home=home7)
+            check(r.returncode == 0, "second sync exit 0")
+            check("Tasks to relabel: 0" in r.stdout, "second sync no-op")
+
+            # switching back to OpenAI restores the default model
+            bak = home7 / "backups" / "codex-api-switch"
+            (bak / "openai-last.toml").write_text(
+                'model = "gpt-5.6-sol"\nmodel_provider = "openai"\n'
+            )
+            r = run("sync", "--target", "openai", "--yes", home=home7)
+            check(r.returncode == 0, "sync back to openai exit 0")
+            check(
+                "Models relabeled: 3 conversation(s) -> gpt-5.6-sol" in r.stdout,
+                "sync back to openai relabels models",
+            )
+            a_text = a_path.read_text(encoding="utf-8")
+            check(
+                '"model":"gpt-5.6-sol"' in a_text,
+                "thread_settings rewritten back to openai model",
+            )
+            conn = sqlite3.connect(home7 / "state_5.sqlite")
+            rows = {
+                r[0]: (r[1], r[2])
+                for r in conn.execute(
+                    "SELECT id, model_provider, model FROM threads"
+                ).fetchall()
+            }
+            conn.close()
+            check(
+                rows["task-aaa"][1] == "gpt-5.6-sol",
+                "sqlite model restored to openai default",
+            )
 
     print("ALL TESTS PASSED")
 
