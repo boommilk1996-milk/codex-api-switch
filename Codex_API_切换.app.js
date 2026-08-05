@@ -7,6 +7,22 @@ app.includeStandardAdditions = true;
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
+function logLine(msg) {
+    // Append to ~/Library/Logs/codex-api-switch-app.log for diagnostics.
+    try {
+        const home = app
+            .doShellScript('printf "%s" "$HOME"')
+            .trim();
+        const stamp = new Date().toISOString();
+        const safe = String(msg).replace(/'/g, "'\\''");
+        app.doShellScript(
+            `printf '%s\\n' '[${stamp}] ${safe}' >> '${home}/Library/Logs/codex-api-switch-app.log' 2>/dev/null || true`
+        );
+    } catch (_) {
+        // logging must never break the app
+    }
+}
+
 function sh(cmd) {
     // Locate the switcher: $CODEX_API_SWITCH override -> PATH -> common spots.
     // doShellScript in an applet runs with a minimal PATH, so we probe
@@ -42,10 +58,25 @@ function sh(cmd) {
     return app.doShellScript(`${q} ${cmd} 2>&1`);
 }
 
-function shJSON(cmd) {
+function shTry(cmd) {
     try {
-        return JSON.parse(sh(cmd));
-    } catch (_) {
+        return { ok: true, out: sh(cmd) };
+    } catch (e) {
+        return { ok: false, error: String(e.message || e) };
+    }
+}
+
+function shJSON(cmd) {
+    const r = shTry(cmd);
+    if (!r.ok) {
+        logLine("sh failed for " + cmd + ": " + r.error);
+        return null;
+    }
+    try {
+        return JSON.parse(r.out);
+    } catch (e) {
+        logLine("JSON parse failed for " + cmd + ": " + e.message +
+                " | raw=" + r.out.slice(0, 400));
         return null;
     }
 }
@@ -120,16 +151,21 @@ function confirmCodexQuit() {
 
 function main() {
     // 1. Get current state
+    logLine("app launched");
     let st;
-    try {
-        st = status();
-    } catch (e) {
-        showError("获取状态失败", `无法读取 Codex 配置。\n\n${e.message || e}`);
-        return;
-    }
+    st = status();
 
     if (!st) {
-        showError("获取状态失败", "无法解析 Codex 配置状态。请检查 config.toml 是否正常。");
+        const detail = shTry("status --json");
+        logLine("status returned null; raw call ok=" + detail.ok);
+        showError(
+            "获取状态失败",
+            "无法解析 Codex 配置状态。\n\n" +
+            "详细日志已写入 ~/Library/Logs/codex-api-switch-app.log\n" +
+            "请把该日志内容发给西西，或直接运行：\n" +
+            "codex-api-switch status --json\n" +
+            "看看是否输出正常 JSON。"
+        );
         return;
     }
 
@@ -265,6 +301,8 @@ function main() {
 
 try {
     main();
+    logLine("app finished");
 } catch (e) {
+    logLine("top-level error: " + String(e.message || e));
     showError("Codex API 切换出错", e.message || String(e));
 }
