@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import base64
 import argparse
+import contextlib
+import io
 import os
 import platform
 import sqlite3
@@ -680,6 +682,88 @@ def main() -> None:
                 rows["task-aaa"][1] == "gpt-5.6-sol",
                 "sqlite model restored to openai default",
             )
+
+        # 17. unreadable state db: graceful errors instead of a bare crash
+        with tempfile.TemporaryDirectory(prefix="codex-switch-dblock-test-") as tmp8:
+            home8 = Path(tmp8)
+            setup_home(home8)
+            import types as dblock_types
+
+            mod8 = dblock_types.ModuleType("codex_api_switch_dblock_mod")
+            mod8.__file__ = str(SWITCHER)
+            with open(SWITCHER, encoding="utf-8") as fh:
+                exec(compile(fh.read(), str(SWITCHER), "exec"), mod8.__dict__)
+
+            sess = home8 / "sessions" / "2026" / "08"
+            sess.mkdir(parents=True, exist_ok=True)
+            make_rollout(sess / "rollout-x.jsonl", "task-xyz", "deepseek")
+            add_reasoning_history(sess / "rollout-x.jsonl", 1)
+            bak = home8 / "backups" / "codex-api-switch"
+            bak.mkdir(parents=True, exist_ok=True)
+            (bak / "openai-last.toml").write_text(
+                'model_provider = "openai"\nmodel = "gpt-5.5"\n'
+            )
+            (home8 / "config.toml").write_text(
+                'model_provider = "deepseek"\nmodel = "deepseek-v4-flash"\n'
+            )
+
+            with mock.patch.dict(os.environ, {"CODEX_SWITCH_HOME": str(home8)}):
+                with mock.patch.object(
+                    mod8.sqlite3,
+                    "connect",
+                    side_effect=sqlite3.OperationalError("unable to open database file"),
+                ), mock.patch.object(mod8.time, "sleep"):
+                    plan = mod8.plan_sync("openai")
+                    check(plan["errors"], "plan_sync reports db error")
+                    check("暂时无法打开" in plan["errors"][0], "plan_sync error is actionable")
+                    check(plan["to_update"] == [], "plan_sync returns empty update list")
+
+                    paths, warning = mod8.all_rollout_paths()
+                    check(
+                        any(p.name == "rollout-x.jsonl" for p in paths),
+                        "sessions tree still scanned when db is locked",
+                    )
+                    check(
+                        warning is not None and "暂时无法读取" in warning,
+                        "db warning surfaced",
+                    )
+
+                    out, err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        code = mod8.command_sync(
+                            argparse.Namespace(target="openai", dry_run=True, yes=False)
+                        )
+                    check(code == 1, f"command_sync with locked db exits 1 (got {code})")
+                    check("暂时无法打开" in err.getvalue(), "sync error message shown")
+
+                    out, err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        code = mod8.command_repair(
+                            argparse.Namespace(
+                                all=True,
+                                session=None,
+                                dry_run=True,
+                                yes=True,
+                                force=False,
+                            )
+                        )
+                    check(code == 0, f"repair dry-run with locked db exits 0 (got {code})")
+                    check("Sessions to repair: 1" in out.getvalue(), "repair still scans files")
+                    check("WARNING" in err.getvalue(), "repair prints db warning")
+
+                    out, err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        code = mod8.command_openai(
+                            argparse.Namespace(no_repair=False, no_sync=False)
+                        )
+                    check(code == 0, f"openai switch with locked db exits 0 (got {code})")
+                    cfg = (home8 / "config.toml").read_text(encoding="utf-8")
+                    check('model_provider = "openai"' in cfg, "config still restored")
+                    check("暂时无法打开" in err.getvalue(), "openai switch explains db error")
+                    check(
+                        "History labels were NOT synced" in err.getvalue(),
+                        "openai switch gives sync guidance",
+                    )
 
     print("ALL TESTS PASSED")
 

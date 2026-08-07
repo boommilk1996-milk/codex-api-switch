@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -62,6 +63,22 @@ def backup_dir() -> Path:
 
 def state_db_path() -> Path:
     return codex_home() / "state_5.sqlite"
+
+
+def connect_state_db_readonly(db: Path) -> sqlite3.Connection | None:
+    """Open the state db read-only, retrying briefly.
+
+    Codex can briefly make the database unopenable while it recreates or
+    upgrades state_5.sqlite (typically while the desktop app is running or
+    right after quitting it). Returns None after retries so callers can
+    degrade gracefully instead of crashing with a bare sqlite error.
+    """
+    for _ in range(3):
+        try:
+            return sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        except sqlite3.Error:
+            time.sleep(0.5)
+    return None
 
 
 def session_index_path() -> Path:
@@ -513,7 +530,13 @@ def plan_sync(target: str) -> dict:
     if not db.exists():
         plan["errors"].append("state_5.sqlite not found; nothing to sync")
         return plan
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    conn = connect_state_db_readonly(db)
+    if conn is None:
+        plan["errors"].append(
+            "state_5.sqlite 暂时无法打开（Codex 可能在运行或正在升级数据库）。\n"
+            "请完全退出 Codex（Cmd+Q）后重试；历史标签未同步。"
+        )
+        return plan
     try:
         tasks = user_tasks(conn)
     finally:
@@ -808,6 +831,9 @@ def command_sync(args: argparse.Namespace) -> int:
     for error in plan["errors"]:
         print(f"ERROR: {error}", file=sys.stderr)
 
+    if plan["errors"]:
+        return 1
+
     if args.dry_run:
         print("Dry run: no files were changed.")
         return 0
@@ -856,43 +882,53 @@ def command_sync(args: argparse.Namespace) -> int:
 REASONING_TYPE = "reasoning"
 
 
-def all_rollout_paths() -> list[Path]:
-    """All rollout files: the sessions tree plus every path recorded in state db."""
+def all_rollout_paths() -> tuple[list[Path], str | None]:
+    """All rollout files plus a warning when the state db could not be read.
+
+    Returns (paths, db_warning): paths are sorted and deduplicated from both
+    the sessions tree and the threads table; db_warning is set when the db is
+    present but unreadable, so callers know the list may be incomplete.
+    """
     paths: dict[Path, None] = {}
+    db_warning: str | None = None
     sessions_dir = codex_home() / "sessions"
     if sessions_dir.is_dir():
         for path in sessions_dir.rglob("rollout-*.jsonl"):
             paths[path] = None
     db = state_db_path()
     if db.exists():
-        try:
-            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        conn = connect_state_db_readonly(db)
+        if conn is None:
+            db_warning = (
+                "state_5.sqlite 暂时无法读取，仅按 sessions 目录扫描；"
+                "若结果不全，请完全退出 Codex（Cmd+Q）后重试。"
+            )
+        else:
             try:
                 rows = conn.execute("SELECT rollout_path FROM threads").fetchall()
             finally:
                 conn.close()
-        except sqlite3.Error:
-            rows = []
-        for (raw,) in rows:
-            if not raw:
-                continue
-            path = Path(raw).expanduser()
-            if path.is_file():
-                paths[path] = None
-    return sorted(paths)
+            for (raw,) in rows:
+                if not raw:
+                    continue
+                path = Path(raw).expanduser()
+                if path.is_file():
+                    paths[path] = None
+    return sorted(paths), db_warning
 
 
 def resolve_rollout_path(session: str) -> Path:
     candidates: list[Path] = []
     seen: set[Path] = set()
-    for path in all_rollout_paths():
+    paths, _db_warning = all_rollout_paths()
+    for path in paths:
         if session in path.name and path not in seen:
             candidates.append(path)
             seen.add(path)
     db = state_db_path()
     if db.exists():
-        try:
-            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        conn = connect_state_db_readonly(db)
+        if conn is not None:
             try:
                 rows = conn.execute(
                     "SELECT id, rollout_path FROM threads WHERE id = ? OR rollout_path LIKE ?",
@@ -900,15 +936,13 @@ def resolve_rollout_path(session: str) -> Path:
                 ).fetchall()
             finally:
                 conn.close()
-        except sqlite3.Error:
-            rows = []
-        for _tid, raw in rows:
-            if not raw:
-                continue
-            path = Path(raw).expanduser()
-            if path.is_file() and path not in seen:
-                candidates.append(path)
-                seen.add(path)
+            for _tid, raw in rows:
+                if not raw:
+                    continue
+                path = Path(raw).expanduser()
+                if path.is_file() and path not in seen:
+                    candidates.append(path)
+                    seen.add(path)
     if not candidates:
         raise ValueError(
             f"No rollout file matches session id '{session}'. "
@@ -1003,14 +1037,15 @@ def backup_rollouts(paths: list[Path]) -> Path:
     return snap
 
 
-def scan_all_rollouts() -> list[tuple[Path, int, int]]:
-    """Return (path, total, bad) for every rollout that needs repair."""
+def scan_all_rollouts() -> tuple[list[tuple[Path, int, int]], str | None]:
+    """Return (repair plan, db warning) across every rollout."""
+    paths, db_warning = all_rollout_paths()
     plan = []
-    for path in all_rollout_paths():
+    for path in paths:
         total, bad = scan_reasoning(path)
         if bad:
             plan.append((path, total, bad))
-    return plan
+    return plan, db_warning
 
 
 def apply_repairs(plan: list[tuple[Path, int, int]]) -> tuple[Path, int]:
@@ -1034,7 +1069,9 @@ def command_repair(args: argparse.Namespace) -> int:
         return 2
 
     if args.all:
-        plan = scan_all_rollouts()
+        plan, db_warning = scan_all_rollouts()
+        if db_warning:
+            print(f"WARNING: {db_warning}", file=sys.stderr)
     else:
         try:
             path = resolve_rollout_path(args.session)
@@ -1044,7 +1081,8 @@ def command_repair(args: argparse.Namespace) -> int:
         total, bad = scan_reasoning(path)
         plan = [(path, total, bad)] if bad else []
 
-    print(f"Sessions scanned: {len(all_rollout_paths()) if args.all else 1}")
+    scanned = len(all_rollout_paths()[0]) if args.all else 1
+    print(f"Sessions scanned: {scanned}")
     print(f"Sessions to repair: {len(plan)}")
     for path, total, bad in plan:
         print(
@@ -1241,7 +1279,9 @@ def command_openai(args: argparse.Namespace) -> int:
             "      Fully quit Codex (Cmd+Q), then run: codex-api-switch repair --all",
         )
     else:
-        repair_plan = scan_all_rollouts()
+        repair_plan, db_warning = scan_all_rollouts()
+        if db_warning:
+            print(f"WARNING: {db_warning}", file=sys.stderr)
         if repair_plan:
             try:
                 snap, changed = apply_repairs(repair_plan)
@@ -1269,6 +1309,12 @@ def command_openai(args: argparse.Namespace) -> int:
             print("History labels already match the OpenAI provider.")
         for error in result["errors"]:
             print(f"ERROR: {error}", file=sys.stderr)
+        if result["errors"]:
+            print(
+                "History labels were NOT synced. Fully quit Codex (Cmd+Q), then run:\n"
+                "  codex-api-switch sync",
+                file=sys.stderr,
+            )
         if result["backup_dir"]:
             print(f"Backup: {result['backup_dir']}")
     return 0
