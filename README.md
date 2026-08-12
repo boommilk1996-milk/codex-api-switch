@@ -114,6 +114,9 @@ codex-api-switch key clear         # 忘记已保存的 Key
 
 # 完全退出 Codex 后，切到 DeepSeek（自动同步历史，Key 自动读取）
 codex-api-switch deepseek
+# 用 DeepSeek V4-Pro-0813（默认是 Flash；已处于 DeepSeek 时同样可用，会原地切换模型）
+codex-api-switch deepseek --model pro
+codex-api-switch deepseek --model flash
 
 # 切回 OpenAI（自动同步历史 + 自动修复 reasoning 历史，防止 array too long）
 codex-api-switch openai
@@ -134,6 +137,8 @@ codex-api-switch repair --all              # 修复全部受影响会话（自�
 3. 首次切换时按提示填写一次 DeepSeek API Key（之后永久保存，不会再问）
 4. 点击"切到 DeepSeek"或"切回 OpenAI"
 5. 应用自动完成配置切换 + 历史同步，重新打开 Codex 即可看到全部历史
+
+切到 DeepSeek 或切换模型时，桌面应用会弹窗让你选模型：**V4 Pro (0813)** 或 **V4 Flash (0731)**；已经处于 DeepSeek 状态时主面板有「切换 Pro/Flash」按钮，可随时原地切换，无需先切回 OpenAI。
 
 DeepSeek API Key 保存在 `~/.codex/backups/codex-api-switch/deepseek-key`（权限 600，仅当前用户可读），切回 OpenAI 也不会丢失；需要更换时用 `codex-api-switch key set 'sk-...'` 覆盖即可。
 

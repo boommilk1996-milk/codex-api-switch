@@ -794,6 +794,45 @@ def main() -> None:
                 "status prints both model versions",
             )
 
+        # 19. deepseek --model pro / in-place model switch
+        with tempfile.TemporaryDirectory(prefix="codex-switch-model-choice-test-") as tmp10:
+            home10 = Path(tmp10)
+            setup_home(home10)
+            (home10 / "config.toml").write_text('model_provider = "openai"\nmodel = "gpt-5.5"\n')
+            env10 = dict(os.environ)
+            env10["CODEX_SWITCH_HOME"] = str(home10)
+            env10["DEEPSEEK_API_KEY"] = "sk-test-1234567890"
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "deepseek", "--model", "pro"],
+                capture_output=True, text=True, env=env10,
+            )
+            check(r.returncode == 0, f"deepseek --model pro exit 0 (got {r.returncode}, {r.stderr})")
+            cfg = (home10 / "config.toml").read_text(encoding="utf-8")
+            check('model = "deepseek-v4-pro"' in cfg, "config uses deepseek-v4-pro")
+            check('model_provider = "deepseek"' in cfg, "provider is deepseek")
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "deepseek", "--model", "flash"],
+                capture_output=True, text=True, env=env10,
+            )
+            check(r.returncode == 0, f"deepseek --model flash in-place exit 0 (got {r.returncode})")
+            check(
+                "DeepSeek model switched to deepseek-v4-flash." in r.stdout,
+                "in-place switch reported",
+            )
+            cfg = (home10 / "config.toml").read_text(encoding="utf-8")
+            check('model = "deepseek-v4-flash"' in cfg, "config back to flash")
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "deepseek", "--model", "pro", "--no-sync"],
+                capture_output=True, text=True, env=env10,
+            )
+            check(r.returncode == 0, "deepseek pro re-switch exit 0")
+            models = json.loads((home10 / "models.json").read_text(encoding="utf-8"))
+            slugs = {m.get("slug") for m in models.get("models", [])}
+            check(
+                "deepseek-v4-flash" in slugs and "deepseek-v4-pro" in slugs,
+                "catalog keeps both models",
+            )
+
     print("ALL TESTS PASSED")
 
 

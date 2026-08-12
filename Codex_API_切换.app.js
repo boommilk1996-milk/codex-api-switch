@@ -147,6 +147,34 @@ function confirmCodexQuit() {
     return choice === "仅切换配置";
 }
 
+// Ask which DeepSeek model to use (V4-Pro-0813 / V4-Flash-0731).
+// currentModel: "deepseek-v4-pro", "deepseek-v4-flash", or null (fresh switch).
+// Returns "pro", "flash", or null when cancelled.
+function chooseDeepseekModel(currentModel) {
+    const isPro = currentModel === "deepseek-v4-pro";
+    const proButton = "V4 Pro (0813)";
+    const flashButton = "V4 Flash (0731)";
+    let picked;
+    try {
+        picked = app.displayDialog(
+            "选择要使用的 DeepSeek 模型：\n\n" +
+            "V4 Pro (0813) —— 更强，适合复杂任务\n" +
+            "V4 Flash (0731) —— 更快更省，适合日常",
+            {
+                withTitle: "选择 DeepSeek 模型",
+                buttons: [proButton, flashButton, "取消"],
+                defaultButton: isPro ? proButton : flashButton,
+                cancelButton: "取消",
+            }
+        ).buttonReturned;
+    } catch (_) {
+        return null; // cancelled
+    }
+    if (picked === proButton) return "pro";
+    if (picked === flashButton) return "flash";
+    return null;
+}
+
 // ── main ───────────────────────────────────────────────────────────────────
 
 function main() {
@@ -197,8 +225,8 @@ function main() {
     let defaultButton;
 
     if (st.is_deepseek) {
-        buttons = ["切回 OpenAI", "查看详情", "取消"];
-        defaultButton = "切回 OpenAI";
+        buttons = ["切回 OpenAI", "切换 Pro/Flash", "取消"];
+        defaultButton = "切换 Pro/Flash";
     } else {
         buttons = ["切到 DeepSeek", "查看详情", "取消"];
         defaultButton = "切到 DeepSeek";
@@ -217,7 +245,7 @@ function main() {
         return;
     }
 
-    // 4. Details
+    // 4. Details (OpenAI state only)
     if (choice === "查看详情") {
         let detail;
         try {
@@ -231,6 +259,21 @@ function main() {
     }
 
     // 5. Switching — require Codex to be quit so history sync can run
+    if (choice === "切换 Pro/Flash") {
+        const model = chooseDeepseekModel(st.model);
+        if (!model) return;
+        let result;
+        try {
+            result = sh(`deepseek --model ${model}`);
+        } catch (e) {
+            showError("切换失败", `切换 DeepSeek 模型时出错:\n\n${e.message || e}`);
+            return;
+        }
+        showInfo("已切换 DeepSeek 模型",
+            `${result}\n\n模型: ${model === "pro" ? "V4 Pro (0813)" : "V4 Flash (0731)"}\n请重启 Codex 后使用。`);
+        return;
+    }
+
     const switchingToDeepseek = choice === "切到 DeepSeek";
     if (!confirmCodexQuit()) return;
 
@@ -266,9 +309,12 @@ function main() {
             apiKeyArg = ` --api-key '${key.replace(/'/g, "'\\''")}'`;
         }
 
+        const model = chooseDeepseekModel(null);
+        if (!model) return;
+
         let result;
         try {
-            result = sh(`deepseek${apiKeyArg}`);
+            result = sh(`deepseek --model ${model}${apiKeyArg}`);
         } catch (e) {
             showError("切换失败", `切到 DeepSeek 时出错:\n\n${e.message || e}`);
             return;
@@ -277,7 +323,7 @@ function main() {
         try { st = status(); } catch (_) { st = null; }
         const newModel = st ? st.model : "deepseek-v4-flash";
         showInfo("已切到 DeepSeek",
-            `${result}\n\n当前模型: ${newModel}\n请重启 Codex 后使用。`);
+            `${result}\n\n当前模型: ${newModel}\n（V4 Pro 0813 / V4 Flash 0731）\n请重启 Codex 后使用。`);
         return;
     }
 

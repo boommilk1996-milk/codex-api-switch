@@ -37,6 +37,7 @@ except ModuleNotFoundError:
 
 
 DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
 DEEPSEEK_MODEL_VERSION = "DeepSeek-V4-Flash-0731"
 DEEPSEEK_PRO_MODEL_VERSION = "DeepSeek-V4-Pro-0813"
 DEEPSEEK_PROVIDER = "deepseek"
@@ -148,11 +149,11 @@ def remove_top_keys(top_lines: list[str], keys: set[str]) -> list[str]:
     return kept
 
 
-def render_deepseek_config(existing_text: str, token: str) -> str:
+def render_deepseek_config(existing_text: str, token: str, model: str = DEEPSEEK_MODEL) -> str:
     lines = existing_text.splitlines()
     top_lines, rest = split_top_level(lines)
     top_values = {
-        "model": DEEPSEEK_MODEL,
+        "model": model,
         "model_provider": DEEPSEEK_PROVIDER,
         "preferred_auth_method": "apikey",
         "forced_login_method": "api",
@@ -417,7 +418,8 @@ def current_provider_from_config() -> str | None:
 def target_default_model(target: str) -> str | None:
     """Model to relabel sessions to when syncing to ``target``."""
     if target == DEEPSEEK_PROVIDER:
-        return DEEPSEEK_MODEL
+        parsed = parse_toml(load_text(config_path()))
+        return parsed.get("model") or DEEPSEEK_MODEL
     restore = backup_dir() / "openai-last.toml"
     if not restore.exists():
         return None
@@ -1141,6 +1143,7 @@ def command_deepseek(args: argparse.Namespace) -> int:
         print("Codex config.toml not found. Is Codex installed?", file=sys.stderr)
         return 1
 
+    target_model = DEEPSEEK_MODEL if args.model in (None, "flash") else DEEPSEEK_PRO_MODEL
     text = load_text(config_file)
     parsed = parse_toml(text)
 
@@ -1150,7 +1153,19 @@ def command_deepseek(args: argparse.Namespace) -> int:
         if token:
             save_deepseek_key(token)
             print("DeepSeek API key persisted for future switches.")
-        print("Already using DeepSeek.", file=sys.stderr)
+        current_model = parsed.get("model")
+        if current_model == target_model:
+            print("Already using DeepSeek.", file=sys.stderr)
+            return 0
+        # Switch the active DeepSeek model (flash <-> pro) in place.
+        make_backup("before-deepseek-model")
+        marker = re.compile(r'^model\s*=\s*"([^"]*)"', re.MULTILINE)
+        updated = marker.sub(lambda m: f'model = "{target_model}"', text, count=1)
+        if parse_toml(updated).get("model") != target_model:
+            print("Failed to switch DeepSeek model in config.toml.", file=sys.stderr)
+            return 1
+        config_file.write_text(updated, encoding="utf-8")
+        print(f"DeepSeek model switched to {target_model}.")
         return 0
 
     token = args.api_key or existing_token(parsed) or load_stored_key()
@@ -1173,13 +1188,13 @@ def command_deepseek(args: argparse.Namespace) -> int:
     codex_home().mkdir(parents=True, exist_ok=True)
     make_backup("before-deepseek")
     save_restore_points()
-    config_file.write_text(render_deepseek_config(text, token), encoding="utf-8")
+    config_file.write_text(render_deepseek_config(text, token, target_model), encoding="utf-8")
     write_models_catalog()
     save_deepseek_key(token)
     if clear_stale_model_cache():
         print("Removed stale Codex model cache (restart Codex to reload model list).")
 
-    print(f"Switched to DeepSeek ({DEEPSEEK_MODEL}).")
+    print(f"Switched to DeepSeek ({target_model}).")
     print("DeepSeek API key saved for future switches (codex-api-switch key status).")
     if args.no_sync:
         print("History label sync skipped (--no-sync).")
@@ -1410,6 +1425,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     deepseek = sub.add_parser("deepseek", help="Switch to DeepSeek (and sync history labels)")
     deepseek.add_argument("--api-key", help="DeepSeek API key (starts with sk-)")
+    deepseek.add_argument(
+        "--model",
+        choices=["flash", "pro"],
+        default=None,
+        help="Which DeepSeek model to use: flash (default) or pro (V4-Pro-0813)",
+    )
     deepseek.add_argument("--no-sync", action="store_true", help="Do not relabel existing history")
     deepseek.set_defaults(func=command_deepseek)
 
