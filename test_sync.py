@@ -765,6 +765,35 @@ def main() -> None:
                         "openai switch gives sync guidance",
                     )
 
+        # 18. DeepSeek model catalog carries the official version tags
+        with tempfile.TemporaryDirectory(prefix="codex-switch-modelver-test-") as tmp9:
+            home9 = Path(tmp9)
+            setup_home(home9)
+            (home9 / "config.toml").write_text('model_provider = "openai"\nmodel = "gpt-5.5"\n')
+            env9 = dict(os.environ)
+            env9["CODEX_SWITCH_HOME"] = str(home9)
+            env9["DEEPSEEK_API_KEY"] = "sk-test-1234567890"
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "deepseek"],
+                capture_output=True, text=True, env=env9,
+            )
+            check(r.returncode == 0, f"deepseek switch exit 0 (got {r.returncode}, {r.stderr})")
+            models = json.loads((home9 / "models.json").read_text(encoding="utf-8"))
+            names = {m.get("slug"): m.get("display_name") for m in models.get("models", [])}
+            check(
+                names.get("deepseek-v4-flash") == "DeepSeek-V4-Flash-0731",
+                "flash catalog shows 0731 version",
+            )
+            check(
+                names.get("deepseek-v4-pro") == "DeepSeek-V4-Pro-0813",
+                "pro catalog shows 0813 version",
+            )
+            r = run("status", home=home9)
+            check(
+                "DeepSeek-V4-Flash-0731 / DeepSeek-V4-Pro-0813" in r.stdout,
+                "status prints both model versions",
+            )
+
     print("ALL TESTS PASSED")
 
 

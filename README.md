@@ -26,6 +26,12 @@ Invalid 'input[7].content': array too long. Expected an array with maximum lengt
 
 这**不是对话丢失，也不是工具写坏文件**，只是历史消息格式与回放 API 不兼容。`repair` 会备份后把这类 `reasoning` 项的 `content` 清空（其余消息原样保留），会话即可继续推进。`openai` 切换命令会在 Codex 未运行时**自动执行修复**，无需手动干预。
 
+## 模型版本
+
+- `deepseek-v4-flash` 当前对应官方 **DeepSeek-V4-Flash-0731**
+- `deepseek-v4-pro` 当前对应官方 **DeepSeek-V4-Pro-0813**（GA 正式版，2026-08-12 发布）
+- 调用名保持不变，切换工具无需改配置即可使用最新版；官方参数：上下文 1M、输出最大 384K、支持思考/非思考模式与 Responses API。
+
 ## 功能
 
 - `deepseek`：切到 DeepSeek Responses API（自动写 `config.toml` 与模型目录）

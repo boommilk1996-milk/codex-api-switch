@@ -37,6 +37,8 @@ except ModuleNotFoundError:
 
 
 DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEEPSEEK_MODEL_VERSION = "DeepSeek-V4-Flash-0731"
+DEEPSEEK_PRO_MODEL_VERSION = "DeepSeek-V4-Pro-0813"
 DEEPSEEK_PROVIDER = "deepseek"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/"
 BACKUP_NAME = "codex-api-switch"
@@ -192,7 +194,8 @@ def write_models_catalog() -> None:
             "models": [
                 {
                     "slug": DEEPSEEK_MODEL,
-                    "display_name": "DeepSeek-V4-Flash",
+                    "display_name": DEEPSEEK_MODEL_VERSION,
+                    "description": "DeepSeek V4 Flash 0731 (latest official release).",
                     "context_window": 1048576,
                     "max_context_window": 1048576,
                     "supported_in_api": True,
@@ -1354,6 +1357,7 @@ def command_status(args: argparse.Namespace) -> int:
         masked = masked_key(token)
         print(f"DeepSeek URL: {deepseek.get('base_url', '(missing)')}")
         print(f"DeepSeek key: {masked}")
+        print(f"DeepSeek 模型版本: {DEEPSEEK_MODEL_VERSION} / {DEEPSEEK_PRO_MODEL_VERSION}")
     else:
         print("DeepSeek: not configured")
     stored = load_stored_key()

@@ -28,8 +28,8 @@
       "comp_hash": "3000",
       "reasoning_summary_format": "experimental",
       "default_reasoning_summary": "none",
-      "display_name": "DeepSeek-V4-Flash",
-      "description": "Latest frontier agentic coding model.",
+  "display_name": "DeepSeek-V4-Flash-0731",
+  "description": "DeepSeek V4 Flash 0731（官方最新版本，调用名 deepseek-v4-flash）。",
       "default_reasoning_level": "high",
       "supported_reasoning_levels": [
         {
@@ -95,8 +95,8 @@
       "comp_hash": "3000",
       "reasoning_summary_format": "experimental",
       "default_reasoning_summary": "none",
-      "display_name": "DeepSeek-V4-Pro",
-      "description": "Most capable frontier agentic coding model.",
+  "display_name": "DeepSeek-V4-Pro-0813",
+  "description": "DeepSeek V4 Pro 0813 正式版（GA，2026-08-12 发布，调用名 deepseek-v4-pro）。",
       "default_reasoning_level": "high",
       "supported_reasoning_levels": [
         {
