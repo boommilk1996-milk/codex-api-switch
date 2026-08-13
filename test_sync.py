@@ -322,6 +322,7 @@ def main() -> None:
         check("History synced: 3 conversation(s)" in r.stdout, "deepseek switch auto-synced 3")
         cfg = (home / "config.toml").read_text(encoding="utf-8")
         check('model_provider = "deepseek"' in cfg, "config switched to deepseek")
+        check('model = "deepseek-v4-pro"' in cfg, "default deepseek model is pro")
         conn = sqlite3.connect(home / "state_5.sqlite")
         providers = set(
             row[0]
@@ -615,21 +616,25 @@ def main() -> None:
             setup_home(home7)
             a_path = home7 / "rollout-a.jsonl"
             add_session_settings(a_path, "gpt-5.5", "openai")
+            # DeepSeek default model is V4-Pro; sync must relabel to it.
+            (home7 / "config.toml").write_text(
+                'model_provider = "deepseek"\nmodel = "deepseek-v4-pro"\n'
+            )
 
             r = run("sync", "--target", "deepseek", "--yes", home=home7)
             check(r.returncode == 0, f"sync with model relabel exit 0 (got {r.returncode}, {r.stderr})")
             check(
-                "Models relabeled: 2 conversation(s) -> deepseek-v4-flash" in r.stdout,
+                "Models relabeled: 2 conversation(s) -> deepseek-v4-pro" in r.stdout,
                 "sync reports model relabel",
             )
             a_text = a_path.read_text(encoding="utf-8")
             check(
-                '"model":"deepseek-v4-flash"' in a_text
+                '"model":"deepseek-v4-pro"' in a_text
                 and '"model_provider_id":"deepseek"' in a_text,
                 "thread_settings model/provider rewritten",
             )
             check(
-                '"personality":{"model":"deepseek-v4-flash"}' in a_text,
+                '"personality":{"model":"deepseek-v4-pro"}' in a_text,
                 "world_state personality model rewritten",
             )
             conn = sqlite3.connect(home7 / "state_5.sqlite")
@@ -641,7 +646,7 @@ def main() -> None:
             }
             conn.close()
             check(
-                rows["task-aaa"] == ("deepseek", "deepseek-v4-flash"),
+                rows["task-aaa"] == ("deepseek", "deepseek-v4-pro"),
                 "sqlite provider+model updated for gpt session",
             )
             check(
@@ -832,6 +837,24 @@ def main() -> None:
                 "deepseek-v4-flash" in slugs and "deepseek-v4-pro" in slugs,
                 "catalog keeps both models",
             )
+
+        # 20. default deepseek switch now uses V4-Pro
+        with tempfile.TemporaryDirectory(prefix="codex-switch-default-pro-test-") as tmp11:
+            home11 = Path(tmp11)
+            setup_home(home11)
+            (home11 / "config.toml").write_text('model_provider = "openai"\nmodel = "gpt-5.5"\n')
+            env11 = dict(os.environ)
+            env11["CODEX_SWITCH_HOME"] = str(home11)
+            env11["DEEPSEEK_API_KEY"] = "sk-test-1234567890"
+            r = subprocess.run(
+                [sys.executable, str(SWITCHER), "deepseek"],
+                capture_output=True, text=True, env=env11,
+            )
+            check(r.returncode == 0, f"default deepseek switch exit 0 (got {r.returncode})")
+            cfg = (home11 / "config.toml").read_text(encoding="utf-8")
+            check('model = "deepseek-v4-pro"' in cfg, "default model is deepseek-v4-pro")
+            r = run("status", home=home11)
+            check("默认模型" in r.stdout, "status shows default model line")
 
     print("ALL TESTS PASSED")
 

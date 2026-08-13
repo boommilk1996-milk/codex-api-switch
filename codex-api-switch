@@ -38,6 +38,7 @@ except ModuleNotFoundError:
 
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
+DEFAULT_DEEPSEEK_MODEL = DEEPSEEK_PRO_MODEL
 DEEPSEEK_MODEL_VERSION = "DeepSeek-V4-Flash-0731"
 DEEPSEEK_PRO_MODEL_VERSION = "DeepSeek-V4-Pro-0813"
 DEEPSEEK_PROVIDER = "deepseek"
@@ -149,7 +150,9 @@ def remove_top_keys(top_lines: list[str], keys: set[str]) -> list[str]:
     return kept
 
 
-def render_deepseek_config(existing_text: str, token: str, model: str = DEEPSEEK_MODEL) -> str:
+def render_deepseek_config(
+    existing_text: str, token: str, model: str = DEFAULT_DEEPSEEK_MODEL
+) -> str:
     lines = existing_text.splitlines()
     top_lines, rest = split_top_level(lines)
     top_values = {
@@ -1143,7 +1146,9 @@ def command_deepseek(args: argparse.Namespace) -> int:
         print("Codex config.toml not found. Is Codex installed?", file=sys.stderr)
         return 1
 
-    target_model = DEEPSEEK_MODEL if args.model in (None, "flash") else DEEPSEEK_PRO_MODEL
+    target_model = (
+        DEEPSEEK_PRO_MODEL if args.model in (None, "pro") else DEEPSEEK_MODEL
+    )
     text = load_text(config_file)
     parsed = parse_toml(text)
 
@@ -1373,6 +1378,7 @@ def command_status(args: argparse.Namespace) -> int:
         print(f"DeepSeek URL: {deepseek.get('base_url', '(missing)')}")
         print(f"DeepSeek key: {masked}")
         print(f"DeepSeek 模型版本: {DEEPSEEK_MODEL_VERSION} / {DEEPSEEK_PRO_MODEL_VERSION}")
+        print(f"DeepSeek 默认模型: {DEFAULT_DEEPSEEK_MODEL} (V4-Pro-0813)")
     else:
         print("DeepSeek: not configured")
     stored = load_stored_key()
@@ -1429,7 +1435,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         choices=["flash", "pro"],
         default=None,
-        help="Which DeepSeek model to use: flash (default) or pro (V4-Pro-0813)",
+        help="Which DeepSeek model to use: pro (default, V4-Pro-0813) or flash (V4-Flash-0731)",
     )
     deepseek.add_argument("--no-sync", action="store_true", help="Do not relabel existing history")
     deepseek.set_defaults(func=command_deepseek)

@@ -151,15 +151,15 @@ function confirmCodexQuit() {
 // currentModel: "deepseek-v4-pro", "deepseek-v4-flash", or null (fresh switch).
 // Returns "pro", "flash", or null when cancelled.
 function chooseDeepseekModel(currentModel) {
-    const isPro = currentModel === "deepseek-v4-pro";
+    const isPro = currentModel !== "deepseek-v4-flash";
     const proButton = "V4 Pro (0813)";
     const flashButton = "V4 Flash (0731)";
     let picked;
     try {
         picked = app.displayDialog(
             "选择要使用的 DeepSeek 模型：\n\n" +
-            "V4 Pro (0813) —— 更强，适合复杂任务\n" +
-            "V4 Flash (0731) —— 更快更省，适合日常",
+            "V4 Pro (0813) —— 更强，适合复杂任务（默认）\n" +
+            "V4 Flash (0731) —— 更快更省，适合日常（可选）",
             {
                 withTitle: "选择 DeepSeek 模型",
                 buttons: [proButton, flashButton, "取消"],
