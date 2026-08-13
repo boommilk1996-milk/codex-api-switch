@@ -856,6 +856,42 @@ def main() -> None:
             r = run("status", home=home11)
             check("默认模型" in r.stdout, "status shows default model line")
 
+        # 21. write-path db failure degrades and rolls back rollout first lines
+        with tempfile.TemporaryDirectory(prefix="codex-switch-dbwrite-test-") as tmp12:
+            home12 = Path(tmp12)
+            setup_home(home12)
+            import types as dbw_types
+
+            mod12 = dbw_types.ModuleType("codex_api_switch_dbw_mod")
+            mod12.__file__ = str(SWITCHER)
+            with open(SWITCHER, encoding="utf-8") as fh:
+                exec(compile(fh.read(), str(SWITCHER), "exec"), mod12.__dict__)
+            real_connect = mod12.sqlite3.connect
+
+            def fake_connect(path, *args, **kwargs):
+                s = str(path)
+                if "mode=ro" in s or s.endswith(".bak"):
+                    return real_connect(path, *args, **kwargs)
+                raise sqlite3.OperationalError("unable to open database file")
+
+            def fake_readonly(db):
+                return real_connect(f"file:{db}?mode=ro", uri=True)
+
+            with mock.patch.dict(os.environ, {"CODEX_SWITCH_HOME": str(home12)}), mock.patch.object(
+                mod12, "connect_state_db_readonly", side_effect=fake_readonly
+            ), mock.patch.object(mod12.sqlite3, "connect", side_effect=fake_connect):
+                result = mod12.sync_history("deepseek")
+            check(result["errors"], "write-path failure reported")
+            check(
+                any("database update failed" in e for e in result["errors"]),
+                "update failure message",
+            )
+            first = (home12 / "rollout-a.jsonl").read_text(encoding="utf-8").split("\n")[0]
+            check(
+                '"model_provider": "openai"' in first,
+                "rollout first line rolled back after update failure",
+            )
+
     print("ALL TESTS PASSED")
 
 

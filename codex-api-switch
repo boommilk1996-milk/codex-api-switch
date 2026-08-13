@@ -698,8 +698,14 @@ def sync_history(target: str, dry_run: bool = False) -> dict:
     result["backup_dir"] = str(snap)
 
     manifest: dict[str, dict] = {}
+    backup_conn = connect_state_db_readonly(db)
+    if backup_conn is None:
+        result["errors"].append(
+            "state_5.sqlite 暂时无法打开（Codex 可能在运行或正在升级数据库），历史标签未同步。\n"
+            "请完全退出 Codex（Cmd+Q）后重试。"
+        )
+        return result
     try:
-        backup_conn = sqlite3.connect(db)
         target_bak = snap / "state_5.sqlite.bak"
         backup_target = sqlite3.connect(target_bak)
         backup_conn.backup(backup_target)
@@ -746,8 +752,9 @@ def sync_history(target: str, dry_run: bool = False) -> dict:
 
     # ── update sqlite (only rows whose rollout was rewritten) ──────────────
     if rewritten:
-        conn = sqlite3.connect(db)
+        conn = None
         try:
+            conn = sqlite3.connect(db)
             conn.execute("BEGIN IMMEDIATE")
             placeholders = ",".join("?" for _ in rewritten)
             if new_model:
@@ -767,7 +774,8 @@ def sync_history(target: str, dry_run: bool = False) -> dict:
             if new_model:
                 result["models_relabeled"] = len(rewritten)
         except Exception as exc:  # noqa: BLE001
-            conn.rollback()
+            if conn is not None:
+                conn.rollback()
             result["errors"].append(f"database update failed: {exc}")
             # Roll back rollout first lines already rewritten
             for thread_id in rewritten:
@@ -782,7 +790,8 @@ def sync_history(target: str, dry_run: bool = False) -> dict:
                         f"rollback of {thread_id} failed; restore from {snap}"
                     )
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     # ── merge missing ids into session_index.jsonl ─────────────────────────
     missing = [tid for tid in plan["session_index_missing_ids"] if tid in rewritten]
@@ -798,7 +807,13 @@ def sync_history(target: str, dry_run: bool = False) -> dict:
                 known.add(json.loads(line).get("id"))
             except json.JSONDecodeError:
                 continue
-        title_map = {t["id"]: t["title"] for t in user_tasks(sqlite3.connect(db))}
+        title_map = {}
+        merge_conn = connect_state_db_readonly(db)
+        if merge_conn is not None:
+            try:
+                title_map = {t["id"]: t["title"] for t in user_tasks(merge_conn)}
+            finally:
+                merge_conn.close()
         added = []
         for tid in missing:
             if tid in known:
